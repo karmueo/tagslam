@@ -38,8 +38,10 @@ set(tagslam_packages
   "image_transport"
   "nav_msgs"
   "rclcpp"
+  "rcl_interfaces"
   "rclcpp_components"
   "rosbag2_cpp"
+  "rosbag2_interfaces"
   "rosbag2_transport"
   "rosgraph_msgs"
   "sensor_msgs"
@@ -47,6 +49,8 @@ set(tagslam_packages
   "tf2_ros"
   "tf2_msgs"
   "tf2")
+
+find_package(visualization_msgs REQUIRED)
 
 set(sync_and_detect_packages
   "apriltag_msgs"
@@ -89,6 +93,7 @@ set(tagslam_dependencies
   opencv_calib3d
   yaml-cpp
   rclcpp::rclcpp
+  ${rcl_interfaces_TARGETS}
   rclcpp_components::component
   rosbag2_cpp::rosbag2_cpp
   rosbag2_transport::rosbag2_transport
@@ -221,6 +226,18 @@ target_link_libraries(sync_and_detect_node sync_and_detect)
 target_include_directories(sync_and_detect_node PRIVATE include)
 target_compile_features(sync_and_detect_node PRIVATE cxx_std_17)
 
+add_library(trajectory_viewer_lib STATIC
+  src/segmented_trajectory.cpp
+  src/trajectory_viewer.cpp)
+target_include_directories(trajectory_viewer_lib PUBLIC include)
+target_link_libraries(trajectory_viewer_lib PUBLIC
+  rclcpp::rclcpp ${geometry_msgs_TARGETS} ${nav_msgs_TARGETS}
+  ${rosbag2_interfaces_TARGETS} ${visualization_msgs_TARGETS})
+target_compile_features(trajectory_viewer_lib PRIVATE cxx_std_17)
+
+add_executable(trajectory_viewer src/trajectory_viewer_node.cpp)
+target_link_libraries(trajectory_viewer trajectory_viewer_lib)
+
 #
 # --------------------- installation -----------------------------
 #
@@ -232,6 +249,7 @@ install(TARGETS
   ${PROJECT_NAME}_from_bag
   sync_and_detect_node
   sync_and_detect_from_bag
+  trajectory_viewer
   DESTINATION lib/${PROJECT_NAME}/)
 
 # the shared library goes into the global lib dir so it can
@@ -243,14 +261,26 @@ install(TARGETS
   DESTINATION lib
 )
 install(PROGRAMS
+  src/python/estimate_from_mcap.py
+  src/python/compare_trajectories.py
   DESTINATION lib/${PROJECT_NAME}/)
 
 install(DIRECTORY
   launch
   DESTINATION share/${PROJECT_NAME}/
   FILES_MATCHING PATTERN "*.py")
+install(DIRECTORY config/ DESTINATION share/${PROJECT_NAME}/config)
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(test_mcap_pipeline test/test_mcap_pipeline.py)
+  ament_add_pytest_test(test_compare_trajectories test/test_compare_trajectories.py)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_minimum_tags_for_pose test/test_minimum_tags_for_pose.cpp)
+  target_link_libraries(test_minimum_tags_for_pose ${PROJECT_NAME})
+  ament_add_gtest(test_segmented_trajectory test/test_segmented_trajectory.cpp)
+  target_link_libraries(test_segmented_trajectory trajectory_viewer_lib
+    ${rosgraph_msgs_TARGETS} ${tf2_msgs_TARGETS})
   find_package(ament_cmake REQUIRED)
   find_package(ament_cmake_copyright REQUIRED)
   find_package(ament_cmake_cppcheck REQUIRED)
@@ -262,7 +292,7 @@ if(BUILD_TESTING)
   find_package(ament_cmake_xmllint REQUIRED)
 
   ament_copyright()
-  ament_cppcheck(LANGUAGE c++)
+  ament_cppcheck(LANGUAGE c++ LIBRARIES googletest)
   ament_cpplint(FILTERS "-build/include,-runtime/indentation_namespace")
   ament_clang_format(CONFIG_FILE .clang-format)
   # ament_flake8()

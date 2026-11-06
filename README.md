@@ -69,6 +69,146 @@ For online operation, launch a ``tagslam`` node like this:
 ros2 launch tagslam tagslam.launch.py use_sim_time:=<True/False> cameras:=<path_to_cameras.yaml_file> camera_poses:=<path_to_camera_poses.yaml file> tagslam_config:=<path_to_tagslam_config_file> use_approximate_sync:=<True/False>
 ```
 
+To view a TagSLAM output bag, source the ROS and workspace environments and
+run the viewer from a graphical session:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source /path/to/workspace/install/setup.bash
+ros2 launch tagslam view_bag.launch.py in_bag:=/absolute/path/to/out_bag
+# Optional: adjust playback speed and the segment gap in seconds.
+ros2 launch tagslam view_bag.launch.py in_bag:=/absolute/path/to/out_bag rate:=1.0 max_gap:=0.03
+```
+
+Playback defaults to half speed and waits for RViz to subscribe. Poses with
+consecutive timestamps more than `max_gap` seconds apart are shown as
+separate segments; isolated poses are shown as points. The default gap is
+0.03 seconds. RViz remains open after playback; closing it or pressing Ctrl+C
+stops the launched processes. If RViz asks to save its configuration on close,
+choose **Discard** to exit without modifying the installed configuration.
+
+By default, pose estimation requires at least three usable, distinct tag IDs
+across all cameras in a synchronized frame. The same ID seen by multiple
+cameras counts once. Hamming distance, squash and ID remapping are applied
+before counting; tags rejected by the configured minimum area or
+body-association rules do not count. Tags that
+can be added to the configured default body count even before they are mapped.
+Frames below the threshold are skipped entirely, including their odometry;
+they produce no new pose or dynamic transform and may create gaps in the
+trajectory. Tag detection output is unaffected.
+
+Set the startup-only ROS parameter `minimum_tags_for_pose` to change the
+threshold, or set it to `0` to disable this check and restore the previous
+behavior. Negative values are invalid. For bag processing, add
+`-p minimum_tags_for_pose:=3` after `--ros-args`; for online operation add
+`minimum_tags_for_pose:=3` to the launch command. The final frame summary
+reports input, threshold-passing, skipped and solved frame counts separately.
+
+### Estimate frame-aligned poses from a stereo MCAP
+
+For MCAP files containing a side-by-side stereo `CompressedImage` topic,
+run the complete offline workflow after sourcing ROS and this workspace:
+
+```bash
+ros2 launch tagslam estimate_from_mcap.launch.py \
+  in_bag:=/absolute/path/to/job_004.mcap
+```
+
+The launch reads `calib.yaml` next to the MCAP by default; override it with
+`calib:=/absolute/path/to/calib.yaml`. Calibration translations in
+`T_cam1_cam0` are interpreted in millimeters. Both cameras must have the
+same resolution and fisheye distortion model. The default topic is
+`/stereo/image_raw`; set `image_topic:=/other/topic` if needed. The installed
+configuration uses 144 mm AprilTags, tag 0 as the map origin, and the left
+camera as the rig origin. IMU messages are not used. The startup parameter
+`minimum_tags_for_pose:=3` can be changed, including `0` to disable the
+filter. A filtered frame need not have a successfully solved pose even when
+it passes the threshold.
+
+By default a new directory is created in `./tagslam_runs/`; set
+`output_dir:=/absolute/new/directory` to choose its location. Existing output
+directories are rejected. On success the directory contains `trajectory.csv`,
+`out_bag/`, the actual `config/`, a `frame_index.csv`, and
+`run_summary.json`; stage logs are `prepare.log`, `tagslam.log` and
+`export.log`. The temporary split stereo bag is removed on success;
+set `keep_intermediate:=true` to retain it. On failure the output directory
+and intermediate data remain available for diagnosis.
+
+The CSV contains one row per input stereo frame, in MCAP message order:
+
+```text
+frame_index,timestamp_ns,bag_timestamp_ns,relative_time_s,pose_valid,frame_id,child_frame_id,x,y,z,qx,qy,qz,qw
+```
+
+`frame_index` starts at zero. `timestamp_ns` is the original image header
+timestamp in integer nanoseconds; `bag_timestamp_ns` is its MCAP record time.
+Relative time is measured from the first image header. Each valid pose is the
+final optimized `map` to `rig` pose, with position in meters and quaternion
+in `x,y,z,w` order. Rows with `pose_valid=0` have empty pose fields, with
+no interpolation. A threshold-passing frame can also lack a solved pose.
+Repeated or decreasing image timestamps, or duplicated or unmatched output
+pose timestamps, cause an error rather than ambiguous alignment. The result
+bag can be inspected with `view_bag.launch.py` as described above.
+
+
+### Compare TagSLAM and OpenVINS trajectory CSVs
+
+The standalone Python 3 tool uses NumPy, SciPy, PyYAML and Matplotlib; it
+requires no ROS runtime. After building, it is also available as
+`ros2 run tagslam compare_trajectories.py` with the same arguments.
+
+```bash
+python3 src/python/compare_trajectories.py \
+  --reference /data/scl_data/slam/stereo_live_bags/EGO/400hz/tagslam_output/trajectory.csv \
+  --estimate /data/scl_data/slam/stereo_live_bags/EGO/400hz/openvins_output/job_004.csv \
+  --calib /data/scl_data/slam/stereo_live_bags/EGO/400hz/calib.yaml \
+  --output-dir /tmp/tagslam_trajectory_comparison_job004
+```
+
+Both CSVs must contain `timestamp_ns`, `pose_valid`, `x,y,z,qx,qy,qz,qw`.
+Poses are world-from-body, positions are in meters, and quaternions use
+`x,y,z,w` order. TagSLAM is the reference (not ground truth), with `rig=cam0`;
+OpenVINS poses describe the IMU. The tool converts OpenVINS poses to cam0 by
+right-multiplying the inverse of `cam0.T_cam_imu` from the calibration YAML,
+whose translation is in millimeters. It does not apply the calibration's
+IMU time offset again or estimate a time offset or scale.
+
+Integer nanosecond timestamps retain their precision. Invalid poses are
+filtered, quaternions normalized, timestamps sorted, and the last valid row
+at each duplicate timestamp retained. Invalid-only timestamps split the
+trajectory. On overlapping reference timestamps, estimate positions are
+linearly interpolated and orientations use shortest-arc SLERP. No
+extrapolation or interpolation across breaks is allowed. Sampling gaps over
+`--max-gap-s` (default `0.1`) also split either trajectory. Missing or malformed
+integer timestamps fail explicitly because their break location is unknown.
+
+All matched positions determine one least-squares rigid alignment, without
+scale correction; its rotation also transforms orientations. Fewer than
+three matches or degenerate position geometry (stationary/collinear tracks)
+produce an error. Position RMSE is the root mean square of 3D position-error
+norms; rotation RMSE uses shortest relative rotation angles in degrees. Each
+matched sample has equal weight. Mean, median, P95 and maximum are also
+reported.
+
+One-meter drift uses nonoverlapping intervals along the reference polyline,
+with both trajectories interpolated at exact meter boundaries. For each
+interval, `delta = inverse(T_start) * T_end` and
+`E = inverse(delta_reference) * delta_estimate`. Translation drift is
+`100 * norm(translation(E)) / 1m` percent; rotation drift is the angle of
+`rotation(E)` in degrees per meter. Counting restarts at every break;
+incomplete tails are omitted and their total distance reported. If no
+complete interval exists, drift is unavailable (`null` in JSON), while
+absolute errors are still reported.
+
+The output directory contains `summary.json` (inputs, conventions, transforms,
+filter counts and statistics), `aligned_trajectory.csv` (matched reference
+and aligned estimate poses, segment IDs and errors), `drift_1m.csv` (one row
+per complete interval), and `trajectory_comparison.png`, `pose_errors.png`,
+`drift_1m.png`. Plots work without a graphical desktop. Rerunning with the
+same output directory replaces these generated files. In the drift CSV,
+distances restart at zero for each `segment_id`; timestamp columns locate
+segments in the original data.
+
 ### Rosbag
 
 When playing from a ros2 bag it's important to pass ``use_sim_time:=True`` to all launch scripts, and to let the ros2 bag player drive the clock:
@@ -94,6 +234,7 @@ ros2 bag play --clock-topics-all my_bag/
 - bad camera pose file
 - wrong tag size
 - wrong tag pose specified
+
 
 
 ## License
