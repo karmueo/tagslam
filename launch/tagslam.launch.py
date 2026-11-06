@@ -23,6 +23,7 @@ from launch.actions import DeclareLaunchArgument as LaunchArg
 from launch.actions import OpaqueFunction
 from launch.substitutions import LaunchConfiguration as LaunchConfig
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def launch_setup(context, *args, **kwargs):
@@ -35,6 +36,8 @@ def launch_setup(context, *args, **kwargs):
         parameters=[{"cameras": LaunchConfig("cameras"),
                      "camera_poses": LaunchConfig("camera_poses"),
                      "tagslam_config": LaunchConfig("tagslam_config"),
+                     "minimum_tags_for_pose": ParameterValue(
+                         LaunchConfig("minimum_tags_for_pose"), value_type=int),
                      "use_sim_time": LaunchConfig("use_sim_time"),
                      "use_approximate_sync": LaunchConfig("use_approximate_sync")}],
         remappings=[],
@@ -49,6 +52,7 @@ def generate_launch_description():
             LaunchArg("cameras", default_value=["cameras.yaml"], description="name of cameras calib file"),
             LaunchArg("camera_poses", default_value=["camera_poses.yaml"], description="name of camera poses file"),
             LaunchArg("tagslam_config", default_value=["tagslam.yaml"], description="name of tagslam config file"),
+            LaunchArg("minimum_tags_for_pose", default_value="3", description="minimum unique usable tags for pose estimation; 0 disables the limit"),
             LaunchArg("use_sim_time", default_value=["False"], description="whether to use sim time"),
             LaunchArg("use_approximate_sync", default_value=["True"], description="whether to use approximate sync"),
             OpaqueFunction(function=launch_setup),

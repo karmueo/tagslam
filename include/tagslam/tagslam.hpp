@@ -59,6 +59,7 @@ namespace tagslam
 class Body;  // forward decl
 class TagSLAM : public TagFactory, public rclcpp::Node
 {
+  friend class TagSLAMTestAccess;
   using string = std::string;
   using Apriltag = apriltag_msgs::msg::AprilTagDetection;
   using TagArray = apriltag_msgs::msg::AprilTagDetectionArray;
@@ -140,6 +141,10 @@ private:
   void processTagsAndOdom(
     const std::vector<TagArrayConstPtr> & tagmsgs,
     const std::vector<OdometryConstPtr> & odommsgs);
+  size_t countUsableTags(const std::vector<TagArrayConstPtr> & tagmsgs) const;
+  bool isTagAreaUsable(const Apriltag & tag) const;
+  void finishFrame(const Header & header);
+  void logFrameSummary() const;
 
   void publishTagAndBodyTransforms(uint64_t t, TFMessage * tfMsg);
   void publishOriginalTagTransforms(uint64_t t, TFMessage * tfMsg);
@@ -211,6 +216,9 @@ private:
   bool amnesia_{false};
   int frameNum_{0};
   int maxFrameNum_{1000000};
+  int minimumTagsForPose_{3};
+  size_t acceptedFrames_{0};
+  size_t skippedFrames_{0};
   int maxHammingDistance_{100};
   int minTagArea_{0};
   int syncQueueSize_{100};

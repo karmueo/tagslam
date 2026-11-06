@@ -68,3 +68,5 @@ Testing/
 .cache/
 
 runs
+# Frame-aligned MCAP processing results
+/tagslam_runs/

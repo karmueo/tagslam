@@ -25,6 +25,7 @@
 #include <geometry_msgs/msg/point.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <iomanip>
+#include <rcl_interfaces/msg/parameter_descriptor.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/serialization.hpp>
 #include <rclcpp/serialized_message.hpp>
@@ -193,6 +194,14 @@ void TagSLAM::readParams()
   fixedFrame_ = declare_parameter<string>("fixed_frame_id", "map");
   maxFrameNum_ = declare_parameter<int>("max_number_of_frames", 0);
   publishAck_ = declare_parameter<bool>("publish_ack", false);
+  rcl_interfaces::msg::ParameterDescriptor descriptor;
+  descriptor.read_only = true;
+  minimumTagsForPose_ =
+    declare_parameter<int>("minimum_tags_for_pose", 3, descriptor);
+  if (minimumTagsForPose_ < 0) {
+    throw std::invalid_argument("minimum_tags_for_pose must be nonnegative");
+  }
+  LOG_INFO("minimum tags for pose: " << minimumTagsForPose_);
 }
 
 static YAML::Node readConfig(
@@ -335,6 +344,15 @@ void TagSLAM::openOutputBag(const string & bag_name)
 void TagSLAM::doDump(bool optimize)
 {
   graphUpdater_.printPerformance();
+  if (times_.empty()) {
+    LOG_WARN("no frames passed the pose processing stage; writing empty bag");
+    logFrameSummary();
+    tagCornerFile_.flush();
+    openOutputBag(outBagName_);
+    outputBag_->close();
+    outputBag_.reset();
+    return;
+  }
   // do final optimization
   if (optimize) {
     profiler_.reset("finalOptimization");
@@ -342,6 +360,7 @@ void TagSLAM::doDump(bool optimize)
     profiler_.record("finalOptimization");
     LOG_INFO("final error: " << error);
   }
+  logFrameSummary();
   graph_->printUnoptimized();
   for (auto & m : measurements_) {
     m->printUnused(graph_);
@@ -786,9 +805,6 @@ void TagSLAM::processTagsAndOdom(
   const std::vector<OdometryConstPtr> & odommsgs)
 {
   profiler_.reset("processOdom");
-  if (amnesia_ && !times_.empty()) {
-    copyPosesAndReset();
-  }
   if (origtagmsgs.empty() && odommsgs.empty()) {
     LOG_WARN("got called with neither tags nor odom!");
     return;
@@ -797,10 +813,6 @@ void TagSLAM::processTagsAndOdom(
   const auto & header =
     origtagmsgs.empty() ? odommsgs[0]->header : origtagmsgs[0]->header;
   const uint64_t t = rclcpp::Time(header.stamp).nanoseconds();
-  if (publishInitialTransforms_) {
-    publishTransforms(t, false /*dont pub orig tf */);
-    publishInitialTransforms_ = false;
-  }
   std::vector<TagArrayConstPtr> tagmsgs;
   remapAndSquash(t, &tagmsgs, origtagmsgs);
   if (tagmsgs.empty() && odommsgs.empty()) {
@@ -810,6 +822,25 @@ void TagSLAM::processTagsAndOdom(
   if (!times_.empty() && t <= times_.back()) {
     LOG_WARN("received old time stamp: " << t);
     return;
+  }
+  if (minimumTagsForPose_ > 0) {
+    const auto count = countUsableTags(tagmsgs);
+    if (count < static_cast<size_t>(minimumTagsForPose_)) {
+      ++skippedFrames_;
+      LOG_INFO(
+        "skipping frame " << frameNum_ << " [" << t << "]: usable tags "
+                          << count << " < " << minimumTagsForPose_);
+      finishFrame(header);
+      return;
+    }
+  }
+  ++acceptedFrames_;
+  if (amnesia_ && !times_.empty()) {
+    copyPosesAndReset();
+  }
+  if (publishInitialTransforms_) {
+    publishTransforms(t, false /*dont pub orig tf */);
+    publishInitialTransforms_ = false;
   }
   const bool hasOdom = !odommsgs.empty() || useFakeOdom_;
   if (anyTagsVisible(tagmsgs) || hasOdom) {
@@ -842,11 +873,16 @@ void TagSLAM::processTagsAndOdom(
   profiler_.reset("publish");
   times_.push_back(t);
   publishAll(t);
-  frameNum_++;
+  finishFrame(header);
+  profiler_.record("publish");
+}
+
+void TagSLAM::finishFrame(const Header & header)
+{
+  ++frameNum_;
   if (publishAck_) {
     ackPub_->publish(header);
   }
-  profiler_.record("publish");
   if (maxFrameNum_ && frameNum_ >= maxFrameNum_) {
     if (publishAck_) {
       auto h = header;
@@ -856,6 +892,24 @@ void TagSLAM::processTagsAndOdom(
     LOG_INFO("reached max number of frames, finished!");
     finalize(true);
   }
+}
+
+void TagSLAM::logFrameSummary() const
+{
+  size_t solved = 0;
+  for (const auto t : times_) {
+    for (const auto & body : nonstaticBodies_) {
+      Transform pose;
+      if (graph_utils::get_optimized_pose(*graph_, t, *body, &pose)) {
+        ++solved;
+        break;
+      }
+    }
+  }
+  LOG_INFO(
+    "frame summary: input=" << frameNum_ << " passed=" << acceptedFrames_
+                            << " skipped=" << skippedFrames_
+                            << " solved=" << solved);
 }
 
 void TagSLAM::publishAll(const uint64_t t)
@@ -1085,6 +1139,27 @@ std::vector<TagConstPtr> TagSLAM::findTags(const std::vector<Apriltag> & ta)
   return (tpv);
 }
 
+bool TagSLAM::isTagAreaUsable(const Apriltag & tag) const
+{
+  return find_size_of_tag(&tag.corners[0]) >= minTagArea_;
+}
+
+size_t TagSLAM::countUsableTags(
+  const std::vector<TagArrayConstPtr> & tagmsgs) const
+{
+  std::unordered_set<int> ids;
+  for (const auto & msg : tagmsgs) {
+    for (const auto & tag : msg->detections) {
+      const bool hasBody = tagMap_.count(tag.id) != 0 ||
+                           (defaultBody_ && !defaultBody_->ignoreTag(tag.id));
+      if (hasBody && isTagAreaUsable(tag)) {
+        ids.insert(tag.id);
+      }
+    }
+  }
+  return ids.size();
+}
+
 void TagSLAM::processTags(
   uint64_t t, const std::vector<TagArrayConstPtr> & tagMsgs,
   std::vector<VertexDesc> * factors)
@@ -1124,7 +1199,7 @@ void TagSLAM::processTags(
           cam->getName() + "-" + Graph::tag_name(tagPtr->getId())));
         auto fac = fp->addToGraph(fp, graph_.get());
         double sz = find_size_of_tag(corners);
-        if (sz < minTagArea_) {
+        if (!isTagAreaUsable(tag)) {
           LOG_WARN(
             "dropping tag: " << tagPtr->getId()
                              << " due to small size: " << sz);
