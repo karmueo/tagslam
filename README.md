@@ -120,32 +120,35 @@ The launch reads `calib.yaml` next to the MCAP by default; override it with
 same resolution and fisheye distortion model. The default topic is
 `/stereo/image_raw`; set `image_topic:=/other/topic` if needed. The installed
 configuration uses 144 mm AprilTags, tag 0 as the map origin, and the left
-camera as the rig origin. IMU messages are not used. The startup parameter
-`minimum_tags_for_pose:=3` can be changed, including `0` to disable the
-filter. A filtered frame need not have a successfully solved pose even when
-it passes the threshold.
+camera as the rig origin. The MCAP pipeline uses the stereo images.
+Set `minimum_tags_for_pose:=0` to disable the filter. A frame can pass the
+threshold and still lack a solved pose.
 
 By default a new directory is created in `./tagslam_runs/`; set
 `output_dir:=/absolute/new/directory` to choose its location. Existing output
-directories are rejected. On success the directory contains `trajectory.csv`,
+directories are rejected. On success the directory contains `trajectory.txt`,
 `out_bag/`, the actual `config/`, a `frame_index.csv`, and
 `run_summary.json`; stage logs are `prepare.log`, `tagslam.log` and
 `export.log`. The temporary split stereo bag is removed on success;
 set `keep_intermediate:=true` to retain it. On failure the output directory
 and intermediate data remain available for diagnosis.
 
-The CSV contains one row per input stereo frame, in MCAP message order:
+The trajectory uses TUM format, with one space-separated line per valid pose
+in input frame order and no header:
 
 ```text
-frame_index,timestamp_ns,bag_timestamp_ns,relative_time_s,pose_valid,frame_id,child_frame_id,x,y,z,qx,qy,qz,qw
+timestamp tx ty tz qx qy qz qw
 ```
 
-`frame_index` starts at zero. `timestamp_ns` is the original image header
-timestamp in integer nanoseconds; `bag_timestamp_ns` is its MCAP record time.
-Relative time is measured from the first image header. Each valid pose is the
+The timestamp is the original image header time in seconds with nine decimal
+places, allowing each pose to be matched to an input frame. Each pose is the
 final optimized `map` to `rig` pose, with position in meters and quaternion
-in `x,y,z,w` order. Rows with `pose_valid=0` have empty pose fields, with
-no interpolation. A threshold-passing frame can also lack a solved pose.
+in `x,y,z,w` order. Frames without a solved pose are omitted without
+interpolation, so the TXT line count equals the number of valid poses. An
+all-missing result is an empty TXT file. The separate `frame_index.csv` retains
+every input frame, its zero-based index, original header timestamp in integer
+nanoseconds, and MCAP record timestamp. A threshold-passing frame can also
+lack a solved pose.
 Repeated or decreasing image timestamps, or duplicated or unmatched output
 pose timestamps, cause an error rather than ambiguous alignment. The result
 bag can be inspected with `view_bag.launch.py` as described above.
@@ -156,6 +159,8 @@ bag can be inspected with `view_bag.launch.py` as described above.
 The standalone Python 3 tool uses NumPy, SciPy, PyYAML and Matplotlib; it
 requires no ROS runtime. After building, it is also available as
 `ros2 run tagslam compare_trajectories.py` with the same arguments.
+It accepts trajectory CSVs only and cannot directly read the TUM TXT output
+of `estimate_from_mcap.launch.py`; previously generated CSVs remain usable.
 
 ```bash
 python3 src/python/compare_trajectories.py \

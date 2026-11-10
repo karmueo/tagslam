@@ -17,8 +17,11 @@
 import argparse
 from array import array
 import csv
+import ctypes
+import errno
 import json
 import math
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -36,8 +39,6 @@ OUTPUT_TOPICS = ('/cam0/image_raw', '/cam1/image_raw')
 END_TOPIC = '/tagslam/end_of_bag'
 POSE_TOPIC = '/tagslam/odom/body_rig'
 INDEX_FIELDS = ('frame_index', 'timestamp_ns', 'bag_timestamp_ns')
-CSV_FIELDS = (*INDEX_FIELDS, 'relative_time_s', 'pose_valid', 'frame_id',
-              'child_frame_id', 'x', 'y', 'z', 'qx', 'qy', 'qz', 'qw')
 
 
 def timestamp_ns(header):
@@ -236,6 +237,27 @@ def read_poses(bag_path, valid_stamps):
     return poses
 
 
+def publish_trajectory(partial, target):
+    """Atomically publish a completed trajectory without replacing the target."""
+    if sys.platform == 'linux':
+        rename = getattr(ctypes.CDLL(None, use_errno=True), 'renameat2', None)
+        if rename is not None:
+            rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                               ctypes.c_char_p, ctypes.c_uint)
+            at_fdcwd = -100
+            rename_noreplace = 1
+            if rename(at_fdcwd, os.fsencode(partial), at_fdcwd, os.fsencode(target),
+                      rename_noreplace) == 0:
+                return
+            error = ctypes.get_errno()
+            if error not in (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP):
+                raise OSError(error, os.strerror(error), target)
+
+    # Older systems and filesystems can still publish atomically with a hard link.
+    os.link(partial, target)
+    partial.unlink()
+
+
 def export(args):
     output = Path(args.output_dir)
     metadata = json.loads((output / 'run_parameters.json').read_text(encoding='utf-8'))
@@ -243,23 +265,20 @@ def export(args):
     if len(frames) != metadata['frame_count']:
         raise ValueError('frame index does not match prepared frame count')
     poses = read_poses(output / 'out_bag', {frame[1] for frame in frames})
-    target = output / 'trajectory.csv'
-    partial = output / 'trajectory.csv.tmp'
+    target = output / 'trajectory.txt'
+    partial = output / 'trajectory.txt.tmp'
     if target.exists() or partial.exists():
-        raise FileExistsError('trajectory CSV or temporary output already exists')
+        raise FileExistsError('trajectory TXT or temporary output already exists')
+    stream = partial.open('x', newline='', encoding='utf-8')
     try:
-        with partial.open('x', newline='', encoding='utf-8') as stream:
-            writer = csv.writer(stream)
-            writer.writerow(CSV_FIELDS)
-            first_stamp = frames[0][1]
-            for frame_index, stamp, bag_stamp in frames:
-                delta = stamp - first_stamp
-                relative = f'{delta // 1_000_000_000}.{delta % 1_000_000_000:09d}'
+        with stream:
+            for _, stamp, _ in frames:
                 pose = poses.get(stamp)
-                writer.writerow((frame_index, stamp, bag_stamp, relative, int(pose is not None),
-                                 'map', 'rig', *((format(x, '.17g') for x in pose)
-                                                 if pose is not None else ('',) * 7)))
-        partial.replace(target)
+                if pose is not None:
+                    timestamp = f'{stamp // 1_000_000_000}.{stamp % 1_000_000_000:09d}'
+                    values = ' '.join(format(value, '.17g') for value in pose)
+                    stream.write(f'{timestamp} {values}\n')
+        publish_trajectory(partial, target)
     except BaseException:
         partial.unlink(missing_ok=True)
         raise

@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import csv
+import errno
 import importlib.util
 import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import cv2
@@ -158,16 +159,15 @@ def test_split_and_frame_aligned_export(tmp_path):
     precise = 0.12345678901234566
     make_pose_bag(output / 'out_bag', [(stamps[0], precise), (stamps[2], -precise)])
     pipeline.export(SimpleNamespace(output_dir=str(output)))
-    with (output / 'trajectory.csv').open(newline='', encoding='utf-8') as stream:
-        rows = list(csv.DictReader(stream))
-    assert len(rows) == 3
-    assert list(rows[0]) == list(pipeline.CSV_FIELDS)
-    assert [int(row['timestamp_ns']) for row in rows] == stamps
-    assert [row['relative_time_s'] for row in rows] == ['0.000000000', '0.020000001', '0.040000002']
-    assert [row['pose_valid'] for row in rows] == ['1', '0', '1']
-    assert float(rows[0]['x']) == precise and float(rows[2]['x']) == -precise
-    assert [rows[1][key] for key in ('x', 'y', 'z', 'qx', 'qy', 'qz', 'qw')] == [''] * 7
-    assert all(row['frame_id'] == 'map' and row['child_frame_id'] == 'rig' for row in rows)
+    lines = (output / 'trajectory.txt').read_text(encoding='utf-8').splitlines()
+    rows = [line.split(' ') for line in lines]
+    assert len(rows) == 2
+    assert all(len(row) == 8 for row in rows)
+    assert [row[0] for row in rows] == ['1700000000.123456789', '1700000000.163456791']
+    assert [float(value) for value in rows[0][1:]] == [precise, -0.125, 1.0, 0, 0, 0, 1]
+    assert [float(value) for value in rows[1][1:]] == [-precise, -0.125, 1.0, 0, 0, 0, 1]
+    assert not (output / 'trajectory.csv').exists()
+    assert not (output / 'trajectory.txt.tmp').exists()
     summary = json.loads((output / 'run_summary.json').read_text())
     assert (summary['frame_count'], summary['valid_pose_count'], summary['missing_pose_count']) == (3, 2, 1)
     assert (output / 'stereo_bag').exists()
@@ -180,10 +180,11 @@ def test_all_missing_and_cleanup(tmp_path):
     output = Path(args.output_dir)
     make_pose_bag(output / 'out_bag', [])
     pipeline.export(SimpleNamespace(output_dir=str(output)))
-    with (output / 'trajectory.csv').open(newline='', encoding='utf-8') as stream:
-        rows = list(csv.DictReader(stream))
-    assert len(rows) == 1 and rows[0]['pose_valid'] == '0' and rows[0]['x'] == ''
+    assert (output / 'trajectory.txt').read_bytes() == b''
+    assert not (output / 'trajectory.csv').exists()
     assert not (output / 'stereo_bag').exists()
+    summary = json.loads((output / 'run_summary.json').read_text())
+    assert (summary['frame_count'], summary['valid_pose_count'], summary['missing_pose_count']) == (1, 0, 1)
 
 
 @pytest.mark.parametrize('stamps,error', [
@@ -212,11 +213,84 @@ def test_bad_image_and_topic_type(tmp_path):
     ([1_000_000_000, 1_000_000_000], 'duplicate pose'),
     ([1_000_000_001], 'does not match'),
 ])
-def test_ambiguous_or_unknown_pose_fails_without_csv(tmp_path, pose_stamps, error):
+def test_ambiguous_or_unknown_pose_fails_without_txt(tmp_path, pose_stamps, error):
     args = args_for(tmp_path, [1_000_000_000])
     pipeline.prepare(args)
     output = Path(args.output_dir)
     make_pose_bag(output / 'out_bag', [(stamp, 0.25) for stamp in pose_stamps])
     with pytest.raises(ValueError, match=error):
         pipeline.export(SimpleNamespace(output_dir=str(output)))
-    assert not (output / 'trajectory.csv').exists()
+    assert not (output / 'trajectory.txt').exists()
+    assert not (output / 'trajectory.txt.tmp').exists()
+
+
+@pytest.mark.parametrize('name', ['trajectory.txt', 'trajectory.txt.tmp'])
+def test_existing_output_is_not_overwritten(tmp_path, name):
+    args = args_for(tmp_path, [1_000_000_000])
+    pipeline.prepare(args)
+    output = Path(args.output_dir)
+    make_pose_bag(output / 'out_bag', [(1_000_000_000, 0.25)])
+    existing = output / name
+    existing.write_text('keep existing contents\n', encoding='utf-8')
+    with pytest.raises(FileExistsError, match='already exists'):
+        pipeline.export(SimpleNamespace(output_dir=str(output)))
+    assert existing.read_text(encoding='utf-8') == 'keep existing contents\n'
+    assert (output / 'stereo_bag').exists()
+
+
+def test_publish_is_atomic_and_does_not_replace_racing_target(tmp_path, monkeypatch):
+    args = args_for(tmp_path, [1_000_000_001])
+    pipeline.prepare(args)
+    output = Path(args.output_dir)
+    make_pose_bag(output / 'out_bag', [(1_000_000_001, 0.25)])
+    publish = pipeline.publish_trajectory
+
+    def publish_with_racing_target(source, target):
+        # The staged file is complete before the final name becomes visible.
+        assert not target.exists()
+        assert source.read_text(encoding='utf-8') == '1.000000001 0.25 -0.125 1 0 0 0 1\n'
+        target.write_text('created concurrently\n', encoding='utf-8')
+        publish(source, target)
+
+    monkeypatch.setattr(pipeline, 'publish_trajectory', publish_with_racing_target)
+    with pytest.raises(FileExistsError):
+        pipeline.export(SimpleNamespace(output_dir=str(output)))
+    assert (output / 'trajectory.txt').read_text(encoding='utf-8') == 'created concurrently\n'
+    assert not (output / 'trajectory.txt.tmp').exists()
+    assert (output / 'stereo_bag').exists()
+
+
+@pytest.mark.skipif(sys.platform != 'linux', reason='Linux uses renameat2')
+def test_publish_without_hard_links(tmp_path, monkeypatch):
+    partial = tmp_path / 'trajectory.txt.tmp'
+    target = tmp_path / 'trajectory.txt'
+    partial.write_text('complete trajectory\n', encoding='utf-8')
+
+    def unsupported_link(*args):
+        raise OSError(errno.EOPNOTSUPP, 'hard links are unsupported')
+
+    monkeypatch.setattr(pipeline.os, 'link', unsupported_link)
+    pipeline.publish_trajectory(partial, target)
+    assert target.read_text(encoding='utf-8') == 'complete trajectory\n'
+    assert not partial.exists()
+
+
+def test_export_preserves_racing_temporary_file(tmp_path, monkeypatch):
+    args = args_for(tmp_path, [1_000_000_000])
+    pipeline.prepare(args)
+    output = Path(args.output_dir)
+    make_pose_bag(output / 'out_bag', [(1_000_000_000, 0.25)])
+    partial = output / 'trajectory.txt.tmp'
+    original_open = Path.open
+
+    def open_with_racing_partial(path, mode='r', **kwargs):
+        if path == partial and mode == 'x':
+            with original_open(path, 'x', encoding='utf-8') as stream:
+                stream.write('owned by another export\n')
+        return original_open(path, mode, **kwargs)
+
+    monkeypatch.setattr(Path, 'open', open_with_racing_partial)
+    with pytest.raises(FileExistsError):
+        pipeline.export(SimpleNamespace(output_dir=str(output)))
+    assert partial.read_text(encoding='utf-8') == 'owned by another export\n'
+    assert not (output / 'trajectory.txt').exists()

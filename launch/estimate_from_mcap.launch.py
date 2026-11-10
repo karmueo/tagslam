@@ -28,7 +28,7 @@ from launch_ros.actions import Node
 
 
 def launch_setup(context):
-    """Validate the request and launch the three managed stages in order."""
+    """Validate the request and launch the three offline stages in order."""
     def arg(name):
         return LaunchConfiguration(name).perform(context)
 
@@ -91,9 +91,9 @@ def launch_setup(context):
         return True
 
     def on_export(event, launch_context):
-        if not check_exit(event, launch_context, 'CSV export'):
+        if not check_exit(event, launch_context, 'TUM export'):
             return []
-        print(f'Completed frame-aligned trajectory: {output / "trajectory.csv"}', flush=True)
+        print(f'Completed frame-aligned trajectory: {output / "trajectory.txt"}', flush=True)
         return [EmitEvent(event=Shutdown(reason='MCAP trajectory export completed'))]
 
     def on_slam(event, launch_context):
