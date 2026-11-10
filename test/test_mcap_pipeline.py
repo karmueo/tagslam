@@ -48,13 +48,17 @@ def set_stamp(message, stamp):
     message.header.stamp.nanosec = stamp % 1_000_000_000
 
 
-def make_source(path, stamps, invalid_image=False, wrong_type=False):
+def make_source(path, stamps, invalid_image=False, wrong_type=False, odom_stamps=()):
     writer = rosbag2_py.SequentialWriter()
     writer.open(rosbag2_py.StorageOptions(uri=str(path), storage_id='mcap'),
                 pipeline.converter_options())
     typename = 'sensor_msgs/msg/Image' if wrong_type else 'sensor_msgs/msg/CompressedImage'
     writer.create_topic(rosbag2_py.TopicMetadata(
         id=0, name='/stereo/image_raw', type=typename, serialization_format='cdr'))
+    if odom_stamps:
+        writer.create_topic(rosbag2_py.TopicMetadata(
+            id=0, name='/openvins/odom', type=pipeline.ODOMETRY_TYPE,
+            serialization_format='cdr'))
     for index, stamp in enumerate(stamps):
         image = np.zeros((6, 16), dtype=np.uint8)
         image[:, :8] = 30 + index
@@ -67,21 +71,34 @@ def make_source(path, stamps, invalid_image=False, wrong_type=False):
         message.format = 'png'
         message.data = b'bad image' if invalid_image else data.tobytes()
         writer.write('/stereo/image_raw', serialize_message(message), 10_000_000_000 + index * 100)
+    for index, stamp in enumerate(odom_stamps):
+        odom = Odometry()
+        set_stamp(odom, stamp)
+        odom.header.frame_id = 'odom'
+        odom.child_frame_id = 'imu'
+        odom.pose.pose.position.x = 0.125 + index
+        odom.pose.pose.orientation.w = 1.0
+        writer.write('/openvins/odom', serialize_message(odom), 10_500_000_000 + index * 100)
     writer.close()
 
 
-def args_for(tmp_path, stamps, invalid_image=False, wrong_type=False):
+def args_for(tmp_path, stamps, invalid_image=False, wrong_type=False, odom_stamps=()):
     source = tmp_path / 'raw'
-    make_source(source, stamps, invalid_image, wrong_type)
+    make_source(source, stamps, invalid_image, wrong_type, odom_stamps)
     calib = tmp_path / 'calib.yaml'
-    calib.write_text(yaml.safe_dump(calibration()), encoding='utf-8')
+    calib_data = calibration()
+    if odom_stamps:
+        calib_data['cam0']['T_cam_imu'] = [[0, -1, 0, 45], [1, 0, 0, 2],
+                                          [0, 0, 1, -19], [0, 0, 0, 1]]
+    calib.write_text(yaml.safe_dump(calib_data), encoding='utf-8')
     template = tmp_path / 'tagslam.yaml'
-    template.write_text('body_defaults: {}\n', encoding='utf-8')
+    template.write_text('bodies: [{rig: {odom_frame_id: rig}}]\n', encoding='utf-8')
     output = tmp_path / 'result'
     output.mkdir()
     return SimpleNamespace(in_bag=str(source), calib=str(calib), output_dir=str(output),
                            image_topic='/stereo/image_raw', template=str(template),
-                           minimum_tags_for_pose=3, keep_intermediate=True)
+                           minimum_tags_for_pose=3, keep_intermediate=True,
+                           vio_odom_topic='/openvins/odom' if odom_stamps else '')
 
 
 def make_pose_bag(path, stamped_poses):
@@ -128,6 +145,55 @@ def test_calibration_conversion():
     bad['T_cam1_cam0'][0][0] = 7
     with pytest.raises(ValueError, match='rigid'):
         pipeline.camera_configuration(bad)
+
+
+def test_prepare_preserves_vio_and_configures_rig(tmp_path):
+    period = 33_333_333
+    stamps = [1_700_000_000_123_456_789 + i * period for i in range(15)]
+    # All odometry is recorded after the images, exceeding the detector's sync queue.
+    odom_stamps = stamps[1:] + [stamps[-1] + period]
+    args = args_for(tmp_path, stamps, odom_stamps=odom_stamps)
+    pipeline.prepare(args)
+    output = Path(args.output_dir)
+    config = yaml.safe_load((output / 'config/tagslam.yaml').read_text(encoding='utf-8'))
+    rig = config['bodies'][0]['rig']
+    assert rig['odom_topic'] == args.vio_odom_topic
+    assert rig['odom_frame_id'] == 'imu'
+    extrinsic = rig['T_body_odom']
+    assert list(extrinsic['position'].values()) == pytest.approx([0.045, 0.002, -0.019])
+    assert list(extrinsic['rotation'].values()) == pytest.approx([0, 0, np.pi / 2])
+    assert pipeline.read_frames(output / 'frame_index.csv') == [
+        (i, stamp, 10_000_000_000 + i * 100) for i, stamp in enumerate(stamps)]
+    metadata = json.loads((output / 'run_parameters.json').read_text(encoding='utf-8'))
+    assert metadata['vio_odom_count'] == len(odom_stamps)
+    assert metadata['vio_matched_frame_count'] == len(stamps) - 1
+
+    def read_bag(path):
+        reader = rosbag2_py.SequentialReader()
+        reader.open(rosbag2_py.StorageOptions(uri=str(path)), pipeline.converter_options())
+        try:
+            messages = []
+            while reader.has_next():
+                messages.append(reader.read_next())
+            return messages
+        finally:
+            reader.close()
+
+    original_odometry = [raw for topic, raw, _ in read_bag(args.in_bag)
+                         if topic == args.vio_odom_topic]
+    replay = read_bag(output / 'stereo_bag')
+    assert [raw for topic, raw, _ in replay if topic == args.vio_odom_topic] == original_odometry
+    expected_topics = [(stamp, topic) for stamp in stamps for topic in pipeline.OUTPUT_TOPICS]
+    expected_topics.extend((stamp, args.vio_odom_topic) for stamp in odom_stamps)
+    expected_topics.append((odom_stamps[-1] + 1, pipeline.END_TOPIC))
+    assert [stamp for _, _, stamp in replay] == sorted(stamp for stamp, _ in expected_topics)
+    assert sorted((stamp, topic) for topic, _, stamp in replay) == sorted(expected_topics)
+
+
+def test_prepare_rejects_vio_without_matching_stamps(tmp_path):
+    args = args_for(tmp_path, [1_000_000_000], odom_stamps=[1_000_000_001])
+    with pytest.raises(ValueError, match='no odometry timestamps matching'):
+        pipeline.prepare(args)
 
 
 def test_split_and_frame_aligned_export(tmp_path):

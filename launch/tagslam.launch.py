@@ -52,7 +52,7 @@ def generate_launch_description():
             LaunchArg("cameras", default_value=["cameras.yaml"], description="name of cameras calib file"),
             LaunchArg("camera_poses", default_value=["camera_poses.yaml"], description="name of camera poses file"),
             LaunchArg("tagslam_config", default_value=["tagslam.yaml"], description="name of tagslam config file"),
-            LaunchArg("minimum_tags_for_pose", default_value="3", description="minimum unique usable tags for pose estimation; 0 disables the limit"),
+            LaunchArg("minimum_tags_for_pose", default_value="1", description="minimum unique usable tags for pose estimation; 0 disables the limit"),
             LaunchArg("use_sim_time", default_value=["False"], description="whether to use sim time"),
             LaunchArg("use_approximate_sync", default_value=["True"], description="whether to use approximate sync"),
             OpaqueFunction(function=launch_setup),

@@ -248,7 +248,7 @@ protected:
 TEST_F(MinimumTagsTest, StartupParameterIsReadOnlyAndRejectsNegative)
 {
   node_ = std::make_shared<TagSLAM>(options());
-  EXPECT_EQ(node_->get_parameter("minimum_tags_for_pose").as_int(), 3);
+  EXPECT_EQ(node_->get_parameter("minimum_tags_for_pose").as_int(), 1);
   EXPECT_FALSE(
     node_->set_parameter(rclcpp::Parameter("minimum_tags_for_pose", 2))
       .successful);
@@ -274,7 +274,9 @@ TEST_F(MinimumTagsTest, CountsOnlyUsableRemappedDistinctIdsWithoutMutatingMap)
 
 TEST_F(MinimumTagsTest, SkipsLowCountsAndContinuesAtThreshold)
 {
-  node_ = std::make_shared<TagSLAM>(options());
+  auto opts = options();
+  opts.append_parameter_override("minimum_tags_for_pose", 3);
+  node_ = std::make_shared<TagSLAM>(opts);
   const auto initialTags = TagSLAMTestAccess::tags(*node_);
   const auto initialFactors = TagSLAMTestAccess::factors(*node_);
   auto odom = std::make_shared<Odometry>();
@@ -358,10 +360,16 @@ TEST_F(MinimumTagsTest, NewTagsCanInitializeAfterPassingThreshold)
 
 TEST_F(MinimumTagsTest, RealOdometrySpansOnlyAcceptedFrames)
 {
+  std::string config = kConfig;
+  const std::string frame = "odom_frame_id: rig";
+  config.replace(
+    config.find(frame), frame.size(),
+    "odom_frame_id: imu\n      odom_topic: /openvins/odom");
+  std::ofstream(dir_ / "tagslam.yaml") << config;
   node_ = std::make_shared<TagSLAM>(options());
   TagSLAMTestAccess::disableAmnesia(*node_);
   auto odom = std::make_shared<Odometry>();
-  odom->child_frame_id = "rig";
+  odom->child_frame_id = "imu";
   odom->pose.pose.orientation.w = 1.0;
   TagSLAMTestAccess::process(
     *node_,
@@ -371,22 +379,33 @@ TEST_F(MinimumTagsTest, RealOdometrySpansOnlyAcceptedFrames)
   ASSERT_EQ(TagSLAMTestAccess::odomProcessors(*node_), 1U);
   const auto factors = TagSLAMTestAccess::factors(*node_);
   odom->pose.pose.position.x = 100.0;
-  TagSLAMTestAccess::process(
-    *node_, {array(2, {detection(0)}), array(2, {})}, {odom});
+  TagSLAMTestAccess::process(*node_, {array(2, {}), array(2, {})}, {odom});
   EXPECT_EQ(TagSLAMTestAccess::factors(*node_), factors);
   EXPECT_FALSE(TagSLAMTestAccess::graph(*node_)->hasPose(
     2000000000ULL, Graph::body_name("rig")));
   odom->pose.pose.position.x = 0.1;
   TagSLAMTestAccess::process(
-    *node_,
-    {array(3, {detection(0, 700), detection(1, 820)}),
-     array(3, {detection(2, 940)})},
-    {odom});
+    *node_, {array(3, {detection(0, 700)}), array(3, {})}, {odom});
   const auto factor = TagSLAMTestAccess::odomFactor(*node_, 3000000000ULL);
   ASSERT_NE(factor, nullptr);
   EXPECT_EQ(factor->getPreviousTime(), 1000000000ULL);
   EXPECT_NEAR(
     factor->getPoseWithNoise().getPose().translation().x(), 0.1, 1e-9);
+
+  node_->finalize(false);
+  rosbag2_cpp::Reader reader;
+  reader.open((dir_ / "out_bag").string());
+  rosbag2_storage::StorageFilter filter;
+  filter.topics = {"/tagslam/odom/body_rig"};
+  reader.set_filter(filter);
+  for (const int second : {1, 3}) {
+    ASSERT_TRUE(reader.has_next());
+    const auto pose = reader.read_next<Odometry>();
+    EXPECT_EQ(pose.header.stamp.sec, second);
+    EXPECT_EQ(pose.header.frame_id, "map");
+    EXPECT_EQ(pose.child_frame_id, "rig");
+  }
+  EXPECT_FALSE(reader.has_next());
 }
 
 TEST_F(MinimumTagsTest, FakeOdometrySpansOnlyAcceptedFrames)
@@ -402,7 +421,7 @@ TEST_F(MinimumTagsTest, FakeOdometrySpansOnlyAcceptedFrames)
     *node_, {array(1, {detection(0, 700), detection(1, 820)}),
              array(1, {detection(2, 940)})});
   const auto factors = TagSLAMTestAccess::factors(*node_);
-  TagSLAMTestAccess::process(*node_, {array(2, {detection(0)}), array(2, {})});
+  TagSLAMTestAccess::process(*node_, {array(2, {}), array(2, {})});
   EXPECT_EQ(TagSLAMTestAccess::factors(*node_), factors);
   EXPECT_FALSE(TagSLAMTestAccess::graph(*node_)->hasPose(
     2000000000ULL, Graph::body_name("rig")));
@@ -438,7 +457,7 @@ TEST_F(MinimumTagsTest, AllSkippedAtFrameLimitWritesReadableEmptyBag)
   }
   ASSERT_GT(TagSLAMTestAccess::ackSubscribers(*node_), 0U);
   TagSLAMTestAccess::process(*node_, {array(1, {}), array(1, {})});
-  TagSLAMTestAccess::process(*node_, {array(2, {detection(1)}), array(2, {})});
+  TagSLAMTestAccess::process(*node_, {array(2, {}), array(2, {})});
   EXPECT_EQ(node_->getNumberOfFrames(), 2U);
   EXPECT_EQ(TagSLAMTestAccess::times(*node_), 0U);
   while (acknowledgements.size() < 3 &&

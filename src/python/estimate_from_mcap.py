@@ -38,6 +38,7 @@ import yaml
 OUTPUT_TOPICS = ('/cam0/image_raw', '/cam1/image_raw')
 END_TOPIC = '/tagslam/end_of_bag'
 POSE_TOPIC = '/tagslam/odom/body_rig'
+ODOMETRY_TYPE = 'nav_msgs/msg/Odometry'
 INDEX_FIELDS = ('frame_index', 'timestamp_ns', 'bag_timestamp_ns')
 
 
@@ -47,6 +48,22 @@ def timestamp_ns(header):
     if sec < 0 or not 0 <= nanosec < 1_000_000_000:
         raise ValueError(f'invalid image or pose timestamp: {sec}.{nanosec}')
     return sec * 1_000_000_000 + nanosec
+
+
+def calibration_transform(value, name):
+    """Validate a rigid calibration transform and convert millimeters to meters."""
+    transform = np.array(value, dtype=np.float64)
+    if (transform.shape != (4, 4) or not np.isfinite(transform).all() or
+            not np.allclose(transform[3], [0, 0, 0, 1], atol=1e-8) or
+            not np.allclose(transform[:3, :3].T @ transform[:3, :3], np.eye(3), atol=1e-5) or
+            not np.isclose(np.linalg.det(transform[:3, :3]), 1.0, atol=1e-5)):
+        raise ValueError(f'{name} must be a finite rigid 4x4 transform')
+    transform[:3, 3] /= 1000.0
+    return transform
+
+
+def xyz(values):
+    return {key: float(value) for key, value in zip('xyz', values)}
 
 
 def camera_configuration(calibration):
@@ -78,20 +95,11 @@ def camera_configuration(calibration):
     if dimensions[0] != dimensions[1]:
         raise ValueError('left and right image resolutions must match')
 
-    transform = np.asarray(calibration['T_cam1_cam0'], dtype=np.float64)
-    if (transform.shape != (4, 4) or not np.isfinite(transform).all() or
-            not np.allclose(transform[3], [0, 0, 0, 1], atol=1e-8) or
-            not np.allclose(transform[:3, :3].T @ transform[:3, :3], np.eye(3), atol=1e-5) or
-            not np.isclose(np.linalg.det(transform[:3, :3]), 1.0, atol=1e-5)):
-        raise ValueError('T_cam1_cam0 must be a finite rigid 4x4 transform')
-    transform = transform.copy()
-    transform[:3, 3] /= 1000.0  # Input translation is in millimeters.
+    transform = calibration_transform(calibration['T_cam1_cam0'], 'T_cam1_cam0')
     inverse = np.linalg.inv(transform)
     rotvec, _ = cv2.Rodrigues(inverse[:3, :3])
 
     def pose(position, rotation):
-        def xyz(values):
-            return {key: float(value) for key, value in zip('xyz', values)}
         return {'pose': {'position': xyz(position), 'rotation': xyz(rotation),
                          'position_noise': xyz([1e-7] * 3),
                          'rotation_noise': xyz([1e-7] * 3)}}
@@ -112,6 +120,10 @@ def prepare(args):
     with open(args.calib, encoding='utf-8') as stream:
         calibration = yaml.safe_load(stream)
     cameras, camera_poses, (width, height) = camera_configuration(calibration)
+    vio_topic = args.vio_odom_topic
+    if vio_topic:
+        cam0_from_imu = calibration_transform(calibration['cam0'].get('T_cam_imu'),
+                                               'cam0.T_cam_imu')
     for filename, content in (('cameras.yaml', cameras), ('camera_poses.yaml', camera_poses)):
         with (config_dir / filename).open('w', encoding='utf-8') as stream:
             yaml.safe_dump(content, stream, sort_keys=False)
@@ -125,11 +137,21 @@ def prepare(args):
     frame_count = 0
     last_header_stamp = None
     last_bag_stamp = None
+    last_odom_stamp = None
+    odom_frames = None
+    image_stamps, odom_stamps = set(), set()
     try:
         types = {topic.name: topic.type for topic in reader.get_all_topics_and_types()}
         if types.get(args.image_topic) != 'sensor_msgs/msg/CompressedImage':
             raise ValueError(f'{args.image_topic} is missing or is not a CompressedImage')
-        reader.set_filter(rosbag2_py.StorageFilter(topics=[args.image_topic]))
+        input_topics = [args.image_topic]
+        if vio_topic:
+            if vio_topic in (*OUTPUT_TOPICS, END_TOPIC):
+                raise ValueError(f'VIO topic conflicts with a generated topic: {vio_topic}')
+            if types.get(vio_topic) != ODOMETRY_TYPE:
+                raise ValueError(f'{vio_topic} is missing or is not an Odometry topic')
+            input_topics.append(vio_topic)
+        reader.set_filter(rosbag2_py.StorageFilter(topics=input_topics))
         writer = rosbag2_py.SequentialWriter()
         writer.open(rosbag2_py.StorageOptions(uri=str(output / 'stereo_bag'), storage_id='mcap'),
                     converter_options())
@@ -138,11 +160,28 @@ def prepare(args):
                 id=0, name=topic, type='sensor_msgs/msg/Image', serialization_format='cdr'))
         writer.create_topic(rosbag2_py.TopicMetadata(
             id=0, name=END_TOPIC, type='std_msgs/msg/Empty', serialization_format='cdr'))
+        if vio_topic:
+            writer.create_topic(rosbag2_py.TopicMetadata(
+                id=0, name=vio_topic, type=ODOMETRY_TYPE, serialization_format='cdr'))
         with (output / 'frame_index.csv').open('w', newline='', encoding='utf-8') as stream:
             index = csv.writer(stream)
             index.writerow(INDEX_FIELDS)
             while reader.has_next():
-                _, serialized, bag_stamp = reader.read_next()
+                topic, serialized, bag_stamp = reader.read_next()
+                last_bag_stamp = bag_stamp
+                if topic == vio_topic:
+                    odom = deserialize_message(serialized, Odometry)
+                    frames = (odom.header.frame_id, odom.child_frame_id)
+                    if not all(frames) or (odom_frames is not None and frames != odom_frames):
+                        raise ValueError(f'{vio_topic} requires nonempty, consistent odometry frames')
+                    odom_frames = frames
+                    stamp = timestamp_ns(odom.header)
+                    if last_odom_stamp is not None and stamp <= last_odom_stamp:
+                        raise ValueError(f'{vio_topic} timestamps must be strictly increasing')
+                    last_odom_stamp = stamp
+                    odom_stamps.add(stamp)
+                    writer.write(topic, serialized, stamp)
+                    continue
                 compressed = deserialize_message(serialized, CompressedImage)
                 stamp = timestamp_ns(compressed.header)
                 if last_header_stamp is not None and stamp <= last_header_stamp:
@@ -157,16 +196,20 @@ def prepare(args):
                     shape = None if image is None else image.shape
                     raise ValueError(f'invalid stereo image at {stamp}: shape={shape}, '
                                      f'expected {(height, 2 * width)}')
+                # Replay matching image and VIO headers together despite recording delays.
+                playback_stamp = stamp if vio_topic else bag_stamp
                 for camera_index, topic in enumerate(OUTPUT_TOPICS):
                     pixels = np.ascontiguousarray(
                         image[:, camera_index * width:(camera_index + 1) * width])
                     message = Image(header=compressed.header, height=height, width=width,
                                     encoding='mono8', is_bigendian=0, step=width,
                                     data=array('B', pixels.tobytes()))
-                    writer.write(topic, serialize_message(message), bag_stamp)
+                    writer.write(topic, serialize_message(message), playback_stamp)
                 index.writerow((frame_count, stamp, bag_stamp))
+                if vio_topic:
+                    image_stamps.add(stamp)
                 frame_count += 1
-                last_header_stamp, last_bag_stamp = stamp, bag_stamp
+                last_header_stamp = stamp
                 if frame_count % 100 == 0:
                     print(f'Prepared {frame_count} stereo frames', flush=True)
             if not frame_count:
@@ -174,7 +217,10 @@ def prepare(args):
             if frame_count >= 2_147_483_647:
                 raise ValueError('too many frames for the TagSLAM frame limit')
             # One additional event ensures the last synchronized detections are processed.
-            writer.write(END_TOPIC, serialize_message(Empty()), last_bag_stamp + 1)
+            last_playback_stamp = last_bag_stamp
+            if vio_topic:
+                last_playback_stamp = max(last_header_stamp, last_odom_stamp or 0)
+            writer.write(END_TOPIC, serialize_message(Empty()), last_playback_stamp + 1)
     finally:
         if writer is not None:
             writer.close()
@@ -184,6 +230,20 @@ def prepare(args):
                 'output_dir': args.output_dir, 'image_topic': args.image_topic,
                 'minimum_tags_for_pose': args.minimum_tags_for_pose,
                 'keep_intermediate': args.keep_intermediate, 'frame_count': frame_count}
+    if vio_topic:
+        matched_count = len(image_stamps & odom_stamps)
+        if not matched_count:
+            raise ValueError(f'{vio_topic} has no odometry timestamps matching the stereo images')
+        config_path = config_dir / 'tagslam.yaml'
+        config = yaml.safe_load(config_path.read_text(encoding='utf-8'))
+        rig = next(body['rig'] for body in config['bodies'] if 'rig' in body)
+        rotation, _ = cv2.Rodrigues(cam0_from_imu[:3, :3])
+        rig.update({'odom_topic': vio_topic, 'odom_frame_id': odom_frames[1],
+                    'T_body_odom': {'position': xyz(cam0_from_imu[:3, 3]),
+                                    'rotation': xyz(rotation.ravel())}})
+        config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding='utf-8')
+        metadata.update({'vio_odom_topic': vio_topic, 'vio_odom_count': len(odom_stamps),
+                         'vio_matched_frame_count': matched_count})
     (output / 'run_parameters.json').write_text(json.dumps(metadata, indent=2) + '\n',
                                                  encoding='utf-8')
     print(f'Prepared {frame_count} frames in {output}', flush=True)
@@ -213,7 +273,7 @@ def read_poses(bag_path, valid_stamps):
     poses = {}
     try:
         types = {topic.name: topic.type for topic in reader.get_all_topics_and_types()}
-        if types.get(POSE_TOPIC) != 'nav_msgs/msg/Odometry':
+        if types.get(POSE_TOPIC) != ODOMETRY_TYPE:
             raise ValueError(f'output bag is missing {POSE_TOPIC} Odometry topic')
         reader.set_filter(rosbag2_py.StorageFilter(topics=[POSE_TOPIC]))
         while reader.has_next():
@@ -299,6 +359,7 @@ def main():
     for name in ('in-bag', 'calib', 'output-dir', 'image-topic', 'template'):
         prep.add_argument('--' + name, required=True)
     prep.add_argument('--minimum-tags-for-pose', type=int, required=True)
+    prep.add_argument('--vio-odom-topic', default='')
     prep.add_argument('--keep-intermediate', action='store_true')
     exp = subcommands.add_parser('export')
     exp.add_argument('--output-dir', required=True)

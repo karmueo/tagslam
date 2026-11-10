@@ -42,6 +42,9 @@ def launch_setup(context):
     image_topic = arg('image_topic')
     if not image_topic or not image_topic.startswith('/'):
         raise RuntimeError('image_topic must be an absolute topic name')
+    vio_odom_topic = arg('vio_odom_topic')
+    if vio_odom_topic and not vio_odom_topic.startswith('/'):
+        raise RuntimeError('vio_odom_topic must be an absolute topic name')
     try:
         minimum_tags = int(arg('minimum_tags_for_pose'))
     except ValueError as error:
@@ -72,6 +75,8 @@ def launch_setup(context):
                        '--minimum-tags-for-pose', str(minimum_tags)]
     if keep_intermediate:
         prepare_command.append('--keep-intermediate')
+    if vio_odom_topic:
+        prepare_command.extend(['--vio-odom-topic', vio_odom_topic])
     prepare = ExecuteProcess(cmd=prepare_command, cwd=str(output), additional_env=env,
                              output='screen')
 
@@ -121,6 +126,7 @@ def launch_setup(context):
                         'output_directory': str(output),
                         'max_number_of_frames': frame_count + 1,
                         'minimum_tags_for_pose': minimum_tags,
+                        'use_approximate_sync': not vio_odom_topic,
                     }])
         return [log_events(slam, 'tagslam'),
                 RegisterEventHandler(OnProcessExit(target_action=slam, on_exit=on_slam)), slam]
@@ -139,7 +145,9 @@ def generate_launch_description():
                               description='New output directory; default: ./tagslam_runs/<name>'),
         DeclareLaunchArgument('image_topic', default_value='/stereo/image_raw',
                               description='Side-by-side CompressedImage topic'),
-        DeclareLaunchArgument('minimum_tags_for_pose', default_value='3',
+        DeclareLaunchArgument('vio_odom_topic', default_value='',
+                              description='Optional IMU-frame VIO Odometry topic'),
+        DeclareLaunchArgument('minimum_tags_for_pose', default_value='1',
                               description='Minimum distinct usable tags; 0 disables the limit'),
         DeclareLaunchArgument('keep_intermediate', default_value='false',
                               description='Keep the split stereo bag after success'),

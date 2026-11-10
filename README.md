@@ -87,7 +87,7 @@ separate segments; isolated poses are shown as points. The default gap is
 stops the launched processes. If RViz asks to save its configuration on close,
 choose **Discard** to exit without modifying the installed configuration.
 
-By default, pose estimation requires at least three usable, distinct tag IDs
+By default, pose estimation requires at least one usable tag ID
 across all cameras in a synchronized frame. The same ID seen by multiple
 cameras counts once. Hamming distance, squash and ID remapping are applied
 before counting; tags rejected by the configured minimum area or
@@ -99,9 +99,9 @@ trajectory. Tag detection output is unaffected.
 
 Set the startup-only ROS parameter `minimum_tags_for_pose` to change the
 threshold, or set it to `0` to disable this check and restore the previous
-behavior. Negative values are invalid. For bag processing, add
-`-p minimum_tags_for_pose:=3` after `--ros-args`; for online operation add
-`minimum_tags_for_pose:=3` to the launch command. The final frame summary
+behavior. Negative values are invalid. To require three tags, add
+`-p minimum_tags_for_pose:=3` after `--ros-args` for bag processing, or add
+`minimum_tags_for_pose:=3` to the online launch command. The final frame summary
 reports input, threshold-passing, skipped and solved frame counts separately.
 
 ### Estimate frame-aligned poses from a stereo MCAP
@@ -120,9 +120,30 @@ The launch reads `calib.yaml` next to the MCAP by default; override it with
 same resolution and fisheye distortion model. The default topic is
 `/stereo/image_raw`; set `image_topic:=/other/topic` if needed. The installed
 configuration uses 144 mm AprilTags, tag 0 as the map origin, and the left
-camera as the rig origin. The MCAP pipeline uses the stereo images.
-Set `minimum_tags_for_pose:=0` to disable the filter. A frame can pass the
-threshold and still lack a solved pose.
+camera as the rig origin. Set `minimum_tags_for_pose:=0` to disable the
+default one-tag filter. A frame can pass the filter and still lack a solved pose.
+
+To fuse OpenVINS with AprilTag observations, pass the IMU-frame odometry
+topic from the same MCAP.
+
+```bash
+ros2 launch tagslam estimate_from_mcap.launch.py \
+  in_bag:=/absolute/path/to/output/job_004_openvins.mcap \
+  calib:=/absolute/path/to/calib.yaml \
+  vio_odom_topic:=/openvins/odom minimum_tags_for_pose:=0
+```
+
+The VIO topic must contain `nav_msgs/msg/Odometry` with consistent frame IDs
+and header timestamps matching the stereo images. The pipeline preserves the
+odometry messages and uses `cam0.T_cam_imu` from the calibration file
+(IMU to left camera, with translation in millimeters). The override to
+`0` allows synchronized frames with no usable tags to use VIO constraints.
+Images without a matching odometry message remain in `frame_index.csv`.
+The temporary bag replays images and VIO in header timestamp order. The frame
+index retains the original image recording timestamps.
+The fused odometry on `/tagslam/odom/body_rig` has `frame_id: map` and
+`child_frame_id: rig`. The run summary includes VIO message and matched-frame
+counts.
 
 By default a new directory is created in `./tagslam_runs/`; set
 `output_dir:=/absolute/new/directory` to choose its location. Existing output

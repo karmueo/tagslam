@@ -216,7 +216,7 @@ private:
   bool amnesia_{false};
   int frameNum_{0};
   int maxFrameNum_{1000000};
-  int minimumTagsForPose_{3};
+  int minimumTagsForPose_{1};
   size_t acceptedFrames_{0};
   size_t skippedFrames_{0};
   int maxHammingDistance_{100};

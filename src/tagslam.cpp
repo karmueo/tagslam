@@ -197,7 +197,7 @@ void TagSLAM::readParams()
   rcl_interfaces::msg::ParameterDescriptor descriptor;
   descriptor.read_only = true;
   minimumTagsForPose_ =
-    declare_parameter<int>("minimum_tags_for_pose", 3, descriptor);
+    declare_parameter<int>("minimum_tags_for_pose", 1, descriptor);
   if (minimumTagsForPose_ < 0) {
     throw std::invalid_argument("minimum_tags_for_pose must be nonnegative");
   }
@@ -735,8 +735,10 @@ void TagSLAM::publishBodyOdom(const uint64_t t)
       pwn = PoseWithNoise(pose, PoseNoise(), isValid);
     }
     if (pwn.isValid()) {
-      auto msg =
-        make_odom(rosTime(t), fixedFrame_, body->getOdomFrameId(), pwn);
+      const auto & child_frame = body->getOdomTopic().empty()
+                                   ? body->getOdomFrameId()
+                                   : body->getFrameId();
+      auto msg = make_odom(rosTime(t), fixedFrame_, child_frame, pwn);
       if (writeToBag_) {
         outputBag_->write<Odometry>(
           msg, "/tagslam/odom/body_" + body->getName(), rosTime(t));

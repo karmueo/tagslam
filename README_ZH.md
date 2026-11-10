@@ -71,9 +71,9 @@ ros2 launch tagslam view_bag.launch.py in_bag:=/absolute/path/to/out_bag rate:=1
 
 默认以半速播放，并等待 RViz 订阅。相邻位姿时间戳间隔超过 `max_gap` 秒时，轨迹会显示为独立的段；孤立位姿显示为点。默认间隔为 0.03 秒。播放结束后 RViz 保持打开；关闭 RViz 或按 Ctrl+C 会停止启动的进程。如果关闭时 RViz 询问是否保存配置，请选择 **Discard**，以免修改已安装的配置。
 
-默认情况下，位姿估计要求一个同步帧的所有相机中至少有三个可用且不同的标记 ID。多个相机看到的同一 ID 只计算一次。计数前会应用汉明距离、squash 和 ID 重映射规则；因配置的最小面积或物体关联规则而被拒绝的标记不计入。可以添加到配置的默认物体中的标记，即使尚未建图也会计入。低于阈值的帧及其里程计会被跳过，这可能导致轨迹和动态变换出现空缺。标记检测输出不受影响。
+默认情况下，位姿估计要求一个同步帧的所有相机中至少有一个可用的标记 ID。多个相机看到的同一 ID 只计算一次。计数前会应用汉明距离、squash 和 ID 重映射规则；因配置的最小面积或物体关联规则而被拒绝的标记不计入。可以添加到配置的默认物体中的标记，即使尚未建图也会计入。低于阈值的帧及其里程计会被跳过，这可能导致轨迹和动态变换出现空缺。标记检测输出不受影响。
 
-启动时可通过 ROS 参数 `minimum_tags_for_pose` 修改阈值，设为 `0` 则禁用此检查并恢复此前的行为。负值无效。处理 bag 时，在 `--ros-args` 后添加 `-p minimum_tags_for_pose:=3`；在线运行时，在启动命令中添加 `minimum_tags_for_pose:=3`。最终的帧统计会分别报告输入帧、通过阈值检查的帧、跳过的帧和已求解的帧数。
+启动时可通过 ROS 参数 `minimum_tags_for_pose` 修改阈值，设为 `0` 则禁用此检查并恢复此前的行为。负值无效。如果需要至少三个标记，处理 bag 时在 `--ros-args` 后添加 `-p minimum_tags_for_pose:=3`，在线运行时在启动命令中添加 `minimum_tags_for_pose:=3`。最终的帧统计会分别报告输入帧、通过阈值检查的帧、跳过的帧和已求解的帧数。
 
 ### 从双目 MCAP 估计与帧对齐的位姿
 
@@ -84,7 +84,20 @@ ros2 launch tagslam estimate_from_mcap.launch.py \
   in_bag:=/absolute/path/to/job_004.mcap
 ```
 
-默认读取 MCAP 同目录下的 `calib.yaml`；可通过 `calib:=/absolute/path/to/calib.yaml` 指定其他文件。`T_cam1_cam0` 中的标定平移量以毫米为单位。两个相机必须具有相同的分辨率和鱼眼畸变模型。默认话题为 `/stereo/image_raw`；需要时可设置 `image_topic:=/other/topic`。安装的配置使用边长 144 毫米的 AprilTag、标记 0 作为地图原点，并以左相机作为相机组原点。此 MCAP 流程使用双目图像。设置 `minimum_tags_for_pose:=0` 可禁用过滤。帧即使通过阈值检查，也可能没有求解出位姿。
+默认读取 MCAP 同目录下的 `calib.yaml`，可通过 `calib:=/absolute/path/to/calib.yaml` 指定其他文件。`T_cam1_cam0` 中的标定平移量以毫米为单位。两个相机必须具有相同的分辨率和鱼眼畸变模型。默认话题为 `/stereo/image_raw`，需要时可设置 `image_topic:=/other/topic`。安装的配置使用边长 144 毫米的 AprilTag、标记 0 作为地图原点，并以左相机作为相机组原点。默认要求至少一个可用标记，设置 `minimum_tags_for_pose:=0` 可禁用过滤。帧即使通过阈值检查，也可能没有求解出位姿。
+
+要融合 OpenVINS 和 AprilTag 观测，请指定同一 MCAP 中以 IMU 为跟踪坐标系的里程计话题。
+
+```bash
+ros2 launch tagslam estimate_from_mcap.launch.py \
+  in_bag:=/absolute/path/to/output/job_004_openvins.mcap \
+  calib:=/absolute/path/to/calib.yaml \
+  vio_odom_topic:=/openvins/odom minimum_tags_for_pose:=0
+```
+
+VIO 话题类型须为 `nav_msgs/msg/Odometry`，坐标系名称须一致，消息头时间戳须与双目图像匹配。流程原样转发里程计，使用标定文件中的 `cam0.T_cam_imu` 将 IMU 坐标转换到左相机坐标，标定平移量以毫米为单位。设为 `0` 后，没有可用标签的同步帧也能使用 VIO 约束。没有匹配里程计的图像仍保留在 `frame_index.csv` 中。融合输出话题为 `/tagslam/odom/body_rig`，父坐标系为 `map`，`child_frame_id` 为 `rig`。运行摘要记录里程计消息数和匹配帧数。
+
+临时 bag 按消息头时间戳回放图像和 VIO。帧索引保留图像在原始 bag 中的记录时间戳。
 
 默认在 `./tagslam_runs/` 下创建新目录；可通过 `output_dir:=/absolute/new/directory` 指定位置。程序会拒绝已存在的输出目录。成功后，该目录包含 `trajectory.txt`、`out_bag/`、实际使用的 `config/`、`frame_index.csv` 和 `run_summary.json`；各阶段日志为 `prepare.log`、`tagslam.log` 和 `export.log`。成功后会删除临时拆分的双目 bag；设置 `keep_intermediate:=true` 可保留。失败时，输出目录和中间数据会保留以供诊断。
 
