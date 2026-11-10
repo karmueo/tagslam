@@ -291,14 +291,16 @@ if(BUILD_TESTING)
   find_package(ament_cmake_lint_cmake REQUIRED)
   find_package(ament_cmake_xmllint REQUIRED)
 
-  ament_copyright()
-  ament_cppcheck(LANGUAGE c++ LIBRARIES googletest)
-  ament_cpplint(FILTERS "-build/include,-runtime/indentation_namespace")
-  ament_clang_format(CONFIG_FILE .clang-format)
+  # Scope lint checks to package sources when a local workspace is present.
+  ament_copyright(.github config example include launch src test
+    CMakeLists.txt package.xml tagslam.repos)
+  ament_cppcheck(include src test LANGUAGE c++ LIBRARIES googletest)
+  ament_cpplint(include src test FILTERS "-build/include,-runtime/indentation_namespace")
+  ament_clang_format(CONFIG_FILE .clang-format include src test)
   # ament_flake8()
   # ament_pep257()
-  ament_lint_cmake()
-  ament_xmllint()
+  ament_lint_cmake(CMakeLists.txt)
+  ament_xmllint(package.xml)
 endif()
 
 ament_package()
