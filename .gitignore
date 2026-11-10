@@ -70,3 +70,9 @@ Testing/
 runs
 # Frame-aligned MCAP processing results
 /tagslam_runs/
+
+# Local colcon workspace (sources live in the repository root)
+/ros2_ws/install/
+/ros2_ws/log/
+/ros2_ws/src/tagslam
+ros2_ws/tagslam_runs
