@@ -146,8 +146,11 @@ The fused odometry on `/tagslam/odom/body_rig` has `frame_id: map` and
 counts.
 
 By default a new directory is created in `./tagslam_runs/`; set
-`output_dir:=/absolute/new/directory` to choose its location. Existing output
-directories are rejected. On success the directory contains `trajectory.txt`,
+`output_dir:=/absolute/path/to/run` to choose its location. An existing
+`output_dir` is deleted and recreated, so repeat runs into the same path start
+clean; the launch file refuses to replace a directory that contains the current
+working directory, input MCAP, or calibration file (including symlink targets).
+On success the directory contains `trajectory.txt`,
 `out_bag/`, the actual `config/`, a `frame_index.csv`, and
 `run_summary.json`; stage logs are `prepare.log`, `tagslam.log` and
 `export.log`. The temporary split stereo bag is removed on success;

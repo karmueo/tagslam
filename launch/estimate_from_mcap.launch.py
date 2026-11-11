@@ -15,6 +15,7 @@
 from datetime import datetime
 import json
 from pathlib import Path
+import shutil
 import sys
 
 from ament_index_python.packages import get_package_prefix, get_package_share_directory
@@ -25,6 +26,30 @@ from launch.event_handlers import OnProcessExit, OnProcessIO
 from launch.events import Shutdown
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+
+
+def prepare_output_directory(output, overwrite, input_files=()):
+    """Create the output directory, replacing a previous run when requested."""
+    output = output.resolve()
+    if not output.exists():
+        output.mkdir(parents=True)
+        return
+    if not overwrite:
+        raise RuntimeError(f'output directory already exists: {output}')
+    if not output.is_dir():
+        raise RuntimeError(f'output path exists and is not a directory: {output}')
+    cwd = Path.cwd().resolve()
+    if output == cwd or output in cwd.parents:
+        raise RuntimeError(f'refusing to replace {output}: it contains the current '
+                           'working directory')
+    for input_file in input_files:
+        input_file = input_file.resolve()
+        if output in input_file.parents:
+            raise RuntimeError(f'refusing to replace {output}: it contains input file '
+                               f'{input_file}')
+    print(f'Replacing existing output directory: {output}', flush=True)
+    shutil.rmtree(output)
+    output.mkdir(parents=True)
 
 
 def launch_setup(context):
@@ -60,7 +85,7 @@ def launch_setup(context):
               Path.cwd() / 'tagslam_runs' /
               f'{in_bag.stem}_{datetime.now().strftime("%Y%m%d_%H%M%S_%f")}')
     # Reserve the directory before any stage can create or replace output data.
-    output.mkdir(parents=True, exist_ok=False)
+    prepare_output_directory(output, overwrite=bool(output_arg), input_files=(in_bag, calib))
     print(f'TagSLAM output directory: {output}', flush=True)
 
     share = Path(get_package_share_directory('tagslam'))
@@ -142,7 +167,8 @@ def generate_launch_description():
         DeclareLaunchArgument('calib', default_value='',
                               description='Calibration YAML; default: calib.yaml next to MCAP'),
         DeclareLaunchArgument('output_dir', default_value='',
-                              description='New output directory; default: ./tagslam_runs/<name>'),
+                              description='Output directory, replaced if it exists; '
+                                          'default: ./tagslam_runs/<name>'),
         DeclareLaunchArgument('image_topic', default_value='/stereo/image_raw',
                               description='Side-by-side CompressedImage topic'),
         DeclareLaunchArgument('vio_odom_topic', default_value='',
