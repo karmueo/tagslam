@@ -1,166 +1,302 @@
 # TagSLAM：基于标记的 SLAM
 
-TagSLAM 是一个基于 ROS 2 的软件包，使用 AprilTag 人工标记进行同步定位与建图。
+TagSLAM 使用 AprilTag 进行同步定位与建图，支持离线 bag 和在线节点。ROS 2 版本仍在开发中，需要 Jazzy、Rolling 或更新版本。多相机和里程计数据须具有匹配的 ROS `header.stamp`；时间不完全一致时使用近似同步。
 
-ROS 2 版本仍在开发中，文档将陆续补充。
-
-## 支持的平台
-
-目前 TagSLAM 需要 ROS 2 Rolling、Jazzy 或更新版本。较早的 ROS 2 版本缺少一些重要的 rosbag2 功能。
+下文使用 Bash。构建从已加载 ROS 环境、且仓库位于 `src/tagslam`（`ros2` 分支）的工作空间根目录开始；运行前加载工作空间环境，准备相机标定 `cameras.yaml`、物体配置 `tagslam.yaml` 和需要时的 `camera_poses.yaml`。相对路径均相对于执行目录；`/absolute/path/`、`/path/to/` 为须替换的路径示例。
 
 ## 构建
 
-构建过程遵循 ROS 2 的标准流程。设置以下 shell 变量：
+以下步骤依据[仓库指南](AGENTS.md#构建与运行)，需具备安装系统依赖的权限。
 
 ```bash
-repo=tagslam
-url=https://github.com/berndpfrommer/${repo}.git
+# 导入工作空间源码依赖
+vcs import \
+  src \
+  < src/tagslam/tagslam.repos
 ```
 
-然后按照[此处](https://github.com/ros-misc-utilities/.github/blob/master/docs/build_ros_repository.md)的 ROS 2 构建说明操作，但需要调整说明以编译 `ros2` 分支。
+| 支持的参数／配置项 | 参数作用 | 输入/输出 | 默认值/支持的值 |
+| --- | --- | --- | --- |
+| `src`（位置参数） | 源码检出位置 | 输出目录 | 本流程显式指定工作空间的 `src` |
+| `<`（Shell 重定向） | 从依赖清单读取标准输入 | 输入文件 | 本流程为 `src/tagslam/tagslam.repos`；依赖版本见[清单](tagslam.repos) |
 
-完成后，务必加载工作空间的 `install/setup.bash`。
+```bash
+# 安装工作空间缺少的系统依赖
+rosdep install \
+  --from-paths src \
+  --ignore-src \
+  -r \
+  -y
+```
+
+| 支持的参数／配置项 | 参数作用 | 输入/输出 | 默认值/支持的值 |
+| --- | --- | --- | --- |
+| `--from-paths` | 扫描包目录 | 输入目录 | 本流程为 `src` |
+| `--ignore-src` | 跳过源码中已有的依赖包 | 行为控制项 | 未指定时不启用 |
+| `-r` | 遇到错误继续处理其他依赖 | 行为控制项 | 未指定时不启用；结束后仍须处理报错 |
+| `-y` | 自动同意安装提示 | 行为控制项 | 未指定时不启用 |
+
+```bash
+# 构建 TagSLAM 及其工作空间依赖
+colcon build \
+  --packages-up-to tagslam
+```
+
+| 支持的参数／配置项 | 参数作用 | 输入/输出 | 默认值/支持的值 |
+| --- | --- | --- | --- |
+| `--packages-up-to` | 选择目标包及递归依赖 | 输入值 | 本流程为 `tagslam`；省略时不按此条件筛选包 |
+
+```bash
+# 加载构建后的工作空间环境
+source \
+  install/setup.bash
+```
+
+| 支持的参数／配置项 | 参数作用 | 输入/输出 | 默认值/支持的值 |
+| --- | --- | --- | --- |
+| 脚本路径（位置参数） | 将环境设置加载到当前终端 | 输入文件 | 必填，无默认值；新终端须先加载 ROS 环境，再加载此文件 |
 
 ## 使用方法
 
 ### 同步与检测
 
-TagSLAM 使用标记数据以及可选的里程计消息。在使用多个相机或里程计的场景中，所有传感器必须同步，即传感器数据的 ROS `header.stamp` 字段相匹配。
+`cameras.yaml` 指定图像话题、传输方式、检测器和标记话题；`tagslam.yaml` 指定物体的里程计话题。近似同步只保留与图像匹配的里程计，将其头时间戳改为图像时间，其他里程计消息丢弃。
 
-`sync_and_detect` 对多个相机运行 AprilTag 检测器，输出包含解码标记的同步消息，供 TagSLAM 使用。它也可以处理里程计：除了与相机图像大致同时到达的消息外，其他里程计消息都会被丢弃；保留消息的 `header.stamp` 会被修改为与图像消息完全一致。
-
-可以从 bag 文件运行 `sync_and_detect` 并将检测到的标记写入另一个 bag，也可以将其作为独立的可组合节点运行。程序通过 `cameras.yaml` 确定输入 bag 的读取话题、图像传输方式（原始或压缩）、标记检测器（MIT 或 UMich）以及标记输出话题，并在 `tagslam.yaml` 中查找配置了里程计话题的物体。
-
-从 bag 运行：
+#### 离线检测
 
 ```bash
-ros2 run tagslam sync_and_detect_from_bag --ros-args -p "cameras:=./cameras.yaml" -p "tagslam_config:=./tagslam.yaml" -p "in_bag:=name_of_input_bag" -p "out_bag:=./tag_bag"
+# 将输入 bag 的同步标记和里程计写入新 bag
+ros2 run tagslam sync_and_detect_from_bag \
+  --ros-args \
+  -p "cameras:=./cameras.yaml" \
+  -p "tagslam_config:=./tagslam.yaml" \
+  -p "in_bag:=./input_bag" \
+  -p "out_bag:=./tag_bag"
 ```
 
-在线运行时，按以下方式启动 `sync_and_detect` 节点：
+参数依据：[离线入口](src/sync_and_detect_from_bag.cpp)、[同步节点](src/sync_and_detect.cpp)。输出路径应使用新的 bag 路径。以下为项目参数；ROS 参数通过 `--ros-args` 后重复的 `-p 名称:=值` 传入。
+
+| 支持的参数／配置项 | 参数作用 | 输入/输出 | 默认值/支持的值 |
+| --- | --- | --- | --- |
+| `--ros-args` | 开始 ROS 参数区 | 行为控制项 | 使用 `-p` 时指定 |
+| `-p` / `--param` | 设置 ROS 参数，可重复 | 输入值 | 格式：`名称:=值` |
+| `cameras` | 相机和检测配置 | 输入文件 | 默认空字符串；必须指定有效 YAML |
+| `tagslam_config` | 物体和里程计配置 | 输入文件 | 默认空字符串；必须指定有效 YAML |
+| `in_bag` | 输入 bag | 输入路径 | 默认空字符串；必须指定 |
+| `out_bag` | 检测结果 bag | 输出路径 | 默认空字符串：只发布消息，不录包 |
+| `max_number_of_frames` | 限制同步帧数 | 行为控制项 | 默认 `0`：不限；正整数；当前入口在计数大于该值后退出 |
+| `use_approximate_sync` | 使用近似同步 | 行为控制项 | 默认 `true`；支持布尔值 |
+| `publish` | 发布标记和同步里程计 | 行为控制项 | 默认 `true`；录包时保持开启 |
+| `<图像话题>.image_transport` | 指定图像传输方式 | 输入值 | 默认取相机配置的 `image_transport`，未配置时为 `raw`；压缩输入可使用 `compressed` |
+
+#### 在线检测
 
 ```bash
-ros2 launch tagslam sync_and_detect.launch.py use_sim_time:=<True/False> cameras:=<path_to_cameras.yaml_file> tagslam_config:=<path_to_tagslam_config_file> use_approximate_sync:=<True/False>
+# 启动同步检测节点
+ros2 launch tagslam sync_and_detect.launch.py \
+  use_sim_time:=False \
+  cameras:=./cameras.yaml \
+  tagslam_config:=./tagslam.yaml \
+  use_approximate_sync:=True
 ```
+
+参数依据：[启动文件](launch/sync_and_detect.launch.py)。回放外部 bag 时改用 `use_sim_time:=True`，并按 [Rosbag](#rosbag) 启动播放器。
+
+| 支持的参数／配置项 | 参数作用 | 输入/输出 | 默认值/支持的值 |
+| --- | --- | --- | --- |
+| `cameras` | 相机配置 | 输入文件 | 默认 `cameras.yaml` |
+| `tagslam_config` | 物体和里程计配置 | 输入文件 | 默认 `tagslam.yaml` |
+| `use_sim_time` | 使用 ROS 仿真时钟 | 行为控制项 | 默认 `False`；支持 `True` / `False` |
+| `use_approximate_sync` | 使用近似同步 | 行为控制项 | 默认 `True`；支持 `True` / `False` |
 
 ### TagSLAM
 
-TagSLAM 可以处理 rosbag，也可以作为节点运行。处理 bag 时，如果 rosbag 中只有图像话题而没有标记话题，TagSLAM 会自动识别并启动 `sync_and_detect` 进行标记检测。
+默认每个同步帧至少需要一个不同的可用标记 ID，多个相机看到同一 ID 只计一次。计数应用汉明距离、squash、ID 重映射、最小面积及物体关联规则；可加入默认物体的未建图标记也计入。低于阈值的帧及其里程计被跳过，可能造成轨迹空缺；检测输出不受影响。`minimum_tags_for_pose:=0` 禁用此检查，通过检查也不保证能求解位姿。结束统计分别报告输入、通过检查、跳过和已求解的帧数。
 
-从 rosbag 运行 TagSLAM：
+#### 离线估计
 
-```bash
-ros2 run tagslam tagslam_from_bag --ros-args -p "cameras:=./cameras.yaml" -p "tagslam_config:=./tagslam.yaml" -p "camera_poses:=./camera_poses.yaml" -p "in_bag:=./bag_with_tags_and_odom" -p "out_bag:=./out_bag"
-```
-
-在线运行时，按以下方式启动 `tagslam` 节点：
+**输出警告：** `outbag` 指定的最终优化结果 bag 若已存在，会被删除并重建；请使用独立输出路径。`out_bag` 是另一个参数，用于录制发布消息，不能代替 `outbag`。依据：[输出实现](src/tagslam.cpp)、[离线入口](src/tagslam_from_bag.cpp)。
 
 ```bash
-ros2 launch tagslam tagslam.launch.py use_sim_time:=<True/False> cameras:=<path_to_cameras.yaml_file> camera_poses:=<path_to_camera_poses.yaml file> tagslam_config:=<path_to_tagslam_config_file> use_approximate_sync:=<True/False>
+# 从标记或原始图像 bag 估计位姿并保存结果
+ros2 run tagslam tagslam_from_bag \
+  --ros-args \
+  -p "cameras:=./cameras.yaml" \
+  -p "tagslam_config:=./tagslam.yaml" \
+  -p "camera_poses:=./camera_poses.yaml" \
+  -p "in_bag:=./bag_with_tags_and_odom" \
+  -p "out_bag:=./out_bag" \
+  -p "outbag:=./optimized_bag" \
+  -p max_number_of_frames:=2147483647
 ```
 
-要查看 TagSLAM 输出的 bag，请加载 ROS 和工作空间环境，然后在图形会话中启动查看器：
+bag 缺少标记话题但包含所需图像时，会自动启动检测。当前离线入口中，帧数上限默认 `0` 会使播放循环首次迭代后退出；示例显式设为 32 位有符号整数上限，供通常的完整 bag 处理。总帧数须小于该上限，才能在读完 bag 后进入最终处理。依据：[循环与结束条件](src/tagslam_from_bag.cpp)。
+
+ROS 参数写法见[离线检测](#离线检测)。下表列出离线入口及 [TagSLAM 节点](src/tagslam.cpp) 可核实的项目参数。
+
+| 支持的参数／配置项 | 参数作用 | 输入/输出 | 默认值/支持的值 |
+| --- | --- | --- | --- |
+| `cameras` | 相机配置 | 输入文件 | 默认空字符串；必须指定有效 YAML |
+| `tagslam_config` | SLAM 和物体配置 | 输入文件 | 默认空字符串；必须指定有效 YAML |
+| `camera_poses` | 相机位姿配置 | 输入文件 | 默认空字符串：不读取外部相机位姿文件 |
+| `in_bag` | 输入 bag | 输入路径 | 默认空字符串；必须指定 |
+| `out_bag` | 录制节点发布的消息 | 输出路径 | 默认空字符串：不录制 |
+| `outbag` | 最终优化结果 bag | 输出路径 | 默认 `out.bag`；已有路径会被替换 |
+| `output_directory` | 保存位姿、标定等结果 | 输出目录 | 默认 `.` |
+| `max_number_of_frames` | 设置处理帧数上限 | 行为控制项 | 默认 `0`；此离线入口须显式设置；示例为 `2147483647` |
+| `minimum_tags_for_pose` | 设置每帧最少可用标记数 | 行为控制项 | 默认 `1`；非负整数，`0` 禁用；仅启动时设置 |
+| `playback_rate` | 最终重播速率 | 行为控制项 | 默认 `5.0`；数值 |
+| `fixed_frame_id` | 固定坐标系名称 | 输入值 | 默认 `map`；字符串 |
+| `publish_ack` | 发布处理确认消息 | 行为控制项 | 默认 `false`；布尔值 |
+
+#### 在线估计
 
 ```bash
-source /opt/ros/jazzy/setup.bash
-source /path/to/workspace/install/setup.bash
-ros2 launch tagslam view_bag.launch.py in_bag:=/absolute/path/to/out_bag
-# 可选：调整播放速度和轨迹分段间隔（秒）。
-ros2 launch tagslam view_bag.launch.py in_bag:=/absolute/path/to/out_bag rate:=1.0 max_gap:=0.03
+# 启动 TagSLAM 节点
+ros2 launch tagslam tagslam.launch.py \
+  use_sim_time:=False \
+  cameras:=./cameras.yaml \
+  camera_poses:=./camera_poses.yaml \
+  tagslam_config:=./tagslam.yaml \
+  use_approximate_sync:=True \
+  minimum_tags_for_pose:=1
 ```
 
-默认以半速播放，并等待 RViz 订阅。相邻位姿时间戳间隔超过 `max_gap` 秒时，轨迹会显示为独立的段；孤立位姿显示为点。默认间隔为 0.03 秒。播放结束后 RViz 保持打开；关闭 RViz 或按 Ctrl+C 会停止启动的进程。如果关闭时 RViz 询问是否保存配置，请选择 **Discard**，以免修改已安装的配置。
+参数依据：[启动文件](launch/tagslam.launch.py)。需要至少三个可用标记时设为 `minimum_tags_for_pose:=3`。回放外部 bag 时设为 `use_sim_time:=True`，参见 [Rosbag](#rosbag)。无输出时核对配置话题、各传感器时间戳和所有节点的时钟设置；运动不平滑时检查图像质量和标记检测，可用 [apriltag_detector](https://github.com/ros-misc-utilities/apriltag_detector) 的 `apriltag_draw` 检查检测结果；重投影误差大或出现 `SUBGRAPH ERROR` 时核对图像质量、标定、相机位姿、标记尺寸和标记位姿。
 
-默认情况下，位姿估计要求一个同步帧的所有相机中至少有一个可用的标记 ID。多个相机看到的同一 ID 只计算一次。计数前会应用汉明距离、squash 和 ID 重映射规则；因配置的最小面积或物体关联规则而被拒绝的标记不计入。可以添加到配置的默认物体中的标记，即使尚未建图也会计入。低于阈值的帧及其里程计会被跳过，这可能导致轨迹和动态变换出现空缺。标记检测输出不受影响。
-
-启动时可通过 ROS 参数 `minimum_tags_for_pose` 修改阈值，设为 `0` 则禁用此检查并恢复此前的行为。负值无效。如果需要至少三个标记，处理 bag 时在 `--ros-args` 后添加 `-p minimum_tags_for_pose:=3`，在线运行时在启动命令中添加 `minimum_tags_for_pose:=3`。最终的帧统计会分别报告输入帧、通过阈值检查的帧、跳过的帧和已求解的帧数。
+| 支持的参数／配置项 | 参数作用 | 输入/输出 | 默认值/支持的值 |
+| --- | --- | --- | --- |
+| `cameras` | 相机配置 | 输入文件 | 默认 `cameras.yaml` |
+| `camera_poses` | 相机位姿配置 | 输入文件 | 默认 `camera_poses.yaml` |
+| `tagslam_config` | SLAM 和物体配置 | 输入文件 | 默认 `tagslam.yaml` |
+| `minimum_tags_for_pose` | 每帧最少可用标记数 | 行为控制项 | 默认 `1`；非负整数，`0` 禁用 |
+| `use_sim_time` | 使用 ROS 仿真时钟 | 行为控制项 | 默认 `False`；支持 `True` / `False` |
+| `use_approximate_sync` | 使用近似同步 | 行为控制项 | 默认 `True`；支持 `True` / `False` |
 
 ### 从双目 MCAP 估计与帧对齐的位姿
 
-对于包含左右并排双目 `CompressedImage` 话题的 MCAP 文件，加载 ROS 和本工作空间后，运行完整的离线流程：
+输入须为包含左右并排双目 `CompressedImage` 的 MCAP。两相机分辨率相同且使用鱼眼模型；标定文件的 `T_cam1_cam0` 平移量以毫米计。安装配置使用边长 144 毫米的 AprilTag、标记 0 作为地图原点、左相机作为相机组原点。依据：[准备脚本](src/python/estimate_from_mcap.py)、[配置模板](config/mcap_stereo_tagslam.yaml)。
+
+**输出警告：** 显式传入 `output_dir` 时，已有目录会被递归删除并重建；不得指向需要保留的数据目录。程序拒绝替换包含当前工作目录、输入 MCAP 或标定文件的目录，并会解析符号链接检查实际输入路径。省略该参数时自动创建带时间戳的新目录。依据：[当前启动文件](launch/estimate_from_mcap.launch.py)。
 
 ```bash
+# 从双目 MCAP 生成与输入帧对齐的最终轨迹
 ros2 launch tagslam estimate_from_mcap.launch.py \
   in_bag:=/absolute/path/to/job_004.mcap
 ```
 
-默认读取 MCAP 同目录下的 `calib.yaml`，可通过 `calib:=/absolute/path/to/calib.yaml` 指定其他文件。`T_cam1_cam0` 中的标定平移量以毫米为单位。两个相机必须具有相同的分辨率和鱼眼畸变模型。默认话题为 `/stereo/image_raw`，需要时可设置 `image_topic:=/other/topic`。安装的配置使用边长 144 毫米的 AprilTag、标记 0 作为地图原点，并以左相机作为相机组原点。默认要求至少一个可用标记，设置 `minimum_tags_for_pose:=0` 可禁用过滤。帧即使通过阈值检查，也可能没有求解出位姿。
+在已加载 ROS 和工作空间环境的终端执行。成功后输出目录包含 `trajectory.txt`、`out_bag/`、`config/`、`frame_index.csv`、`run_summary.json`，阶段日志为 `prepare.log`、`tagslam.log`、`export.log`；失败时保留输出及中间数据供诊断。
 
-要融合 OpenVINS 和 AprilTag 观测，请指定同一 MCAP 中以 IMU 为跟踪坐标系的里程计话题。
+| 支持的参数／配置项 | 参数作用 | 输入/输出 | 默认值/支持的值 |
+| --- | --- | --- | --- |
+| `in_bag` | 原始双目 MCAP | 输入文件 | 必填，无默认值；须为存在的 `.mcap` 文件 |
+| `calib` | 双目标定 | 输入文件 | 默认输入 MCAP 同目录的 `calib.yaml` |
+| `output_dir` | 保存整次运行结果 | 输出目录 | 默认自动生成 `./tagslam_runs/<MCAP文件名去扩展名>_<年月日_时分秒_微秒>/`；显式指定时替换已有目录 |
+| `image_topic` | 双目压缩图像话题 | 输入值 | 默认 `/stereo/image_raw`；以 `/` 开头 |
+| `vio_odom_topic` | IMU 坐标系 VIO 里程计话题 | 输入值 | 默认空字符串：不融合 VIO；指定时以 `/` 开头，类型为 `nav_msgs/msg/Odometry` |
+| `minimum_tags_for_pose` | 每帧最少可用标记数 | 行为控制项 | 默认 `1`；范围 `0`～`2147483647`，`0` 禁用 |
+| `keep_intermediate` | 成功后保留拆分双目 bag | 行为控制项 | 默认 `false`：成功后删除；支持 `true` / `false` |
+
+融合 OpenVINS 时，里程计须在同一 MCAP 中、以 IMU 为跟踪坐标系，坐标系名称一致，头时间戳与双目图像匹配；标定须包含平移量以毫米计的 `cam0.T_cam_imu`。
 
 ```bash
+# 融合同一 MCAP 中的 VIO 与 AprilTag 观测
 ros2 launch tagslam estimate_from_mcap.launch.py \
   in_bag:=/absolute/path/to/output/job_004_openvins.mcap \
   calib:=/absolute/path/to/calib.yaml \
-  vio_odom_topic:=/openvins/odom minimum_tags_for_pose:=0
+  vio_odom_topic:=/openvins/odom \
+  minimum_tags_for_pose:=0
 ```
 
-VIO 话题类型须为 `nav_msgs/msg/Odometry`，坐标系名称须一致，消息头时间戳须与双目图像匹配。流程原样转发里程计，使用标定文件中的 `cam0.T_cam_imu` 将 IMU 坐标转换到左相机坐标，标定平移量以毫米为单位。设为 `0` 后，没有可用标签的同步帧也能使用 VIO 约束。没有匹配里程计的图像仍保留在 `frame_index.csv` 中。融合输出话题为 `/tagslam/odom/body_rig`，父坐标系为 `map`，`child_frame_id` 为 `rig`。运行摘要记录里程计消息数和匹配帧数。
+参数见上表。设为 `0` 后，无可用标记的同步帧也可使用 VIO。流程原样转发里程计，按标定将 IMU 转换到左相机坐标；融合输出为 `/tagslam/odom/body_rig`，父坐标系 `map`、子坐标系 `rig`。摘要记录里程计消息数与匹配帧数；未匹配里程计的图像仍保留在帧索引中。临时 bag 按头时间戳回放，帧索引保留原始 MCAP 记录时间。
 
-临时 bag 按消息头时间戳回放图像和 VIO。帧索引保留图像在原始 bag 中的记录时间戳。
+`trajectory.txt` 无表头，每个有效位姿一行：`timestamp tx ty tz qx qy qz qw`。时间为原始图像头时间（秒，九位小数），位姿为最终优化后的 `map` 到 `rig`，位置单位为米。未求解帧省略且不插值；全部缺失时文件为空。`frame_index.csv` 保留所有输入帧、从零开始的索引、整数纳秒头时间戳及 MCAP 记录时间。图像时间戳重复或递减、输出位姿时间戳重复或无法匹配时会报错。查看结果使用下一节命令。
 
-默认在 `./tagslam_runs/` 下创建新目录；可通过 `output_dir:=/absolute/new/directory` 指定位置。程序会拒绝已存在的输出目录。成功后，该目录包含 `trajectory.txt`、`out_bag/`、实际使用的 `config/`、`frame_index.csv` 和 `run_summary.json`；各阶段日志为 `prepare.log`、`tagslam.log` 和 `export.log`。成功后会删除临时拆分的双目 bag；设置 `keep_intermediate:=true` 可保留。失败时，输出目录和中间数据会保留以供诊断。
+### 查看输出 bag
 
-轨迹采用 TUM 格式，按输入帧顺序为每个有效位姿输出一行，以空格分隔，无表头：
+新终端须先加载 ROS，再加载工作空间；以下为 Jazzy 示例。
 
-```text
-timestamp tx ty tz qx qy qz qw
+```bash
+# 加载 ROS Jazzy 环境
+source \
+  /opt/ros/jazzy/setup.bash
+
+# 加载本工作空间环境
+source \
+  /path/to/workspace/install/setup.bash
 ```
 
-时间戳是原始图像头的时间，以秒为单位，保留九位小数，可用于将位姿匹配到输入帧。每个位姿都是最终优化后的 `map` 到 `rig` 位姿，位置以米为单位，四元数按 `x,y,z,w` 排列。没有求解出位姿的帧会被省略，不进行插值，因此 TXT 行数等于有效位姿数。如果所有位姿均缺失，TXT 文件为空。单独的 `frame_index.csv` 保留每个输入帧、从零开始的索引、整数纳秒表示的原始头时间戳以及 MCAP 记录时间戳。通过阈值检查的帧也可能没有求解出位姿。
+`source` 参数见[构建](#构建)。查看器需要图形会话，输入为包含 `metadata.yaml` 的结果 bag 目录。
 
-图像时间戳重复或递减，以及输出位姿时间戳重复或无法匹配时，程序会报错，避免产生有歧义的对齐结果。可按上述方法使用 `view_bag.launch.py` 查看结果 bag。
+```bash
+# 在 RViz 中回放结果并显示轨迹
+ros2 launch tagslam view_bag.launch.py \
+  in_bag:=/absolute/path/to/out_bag
+```
+
+参数依据：[查看器启动文件](launch/view_bag.launch.py)。默认半速播放并等待 RViz 订阅；超过 `max_gap` 秒的轨迹分段，孤立位姿显示为点。播放结束后 RViz 保持打开；关闭 RViz 或按 Ctrl+C 停止进程。RViz 询问保存配置时选 **Discard**，避免修改已安装配置。
+
+| 支持的参数／配置项 | 参数作用 | 输入/输出 | 默认值/支持的值 |
+| --- | --- | --- | --- |
+| `in_bag` | TagSLAM 结果 bag | 输入目录 | 必填，无默认值；目录须包含 `metadata.yaml` |
+| `rate` | 播放速度倍率 | 行为控制项 | 默认 `0.5`；有限正数 |
+| `max_gap` | 轨迹分段时间间隔 | 输入值 | 默认 `0.03` 秒；有限正数 |
+| `DISPLAY` / `WAYLAND_DISPLAY`（环境变量） | 指定图形会话 | 输入值 | 依赖桌面环境，至少一个已设置 |
+
+```bash
+# 以正常速度回放，并使用 0.03 秒轨迹分段间隔
+ros2 launch tagslam view_bag.launch.py \
+  in_bag:=/absolute/path/to/out_bag \
+  rate:=1.0 \
+  max_gap:=0.03
+```
 
 ### 比较 TagSLAM 和 OpenVINS 轨迹 CSV
 
-独立的 Python 3 工具依赖 NumPy、SciPy、PyYAML 和 Matplotlib，无需 ROS 运行环境。构建后也可以使用相同参数通过 `ros2 run tagslam compare_trajectories.py` 运行。该工具只接受轨迹 CSV，不能直接读取 `estimate_from_mcap.launch.py` 输出的 TUM TXT；此前生成的 CSV 仍可使用。
+从仓库根目录执行，需 Python 3、NumPy、SciPy、PyYAML 和 Matplotlib，无需 ROS 或图形桌面。工具只接受 CSV，**不能直接读取上述流程输出的 TUM TXT**；可使用此前已有的 CSV。构建后也可将脚本入口替换为 `ros2 run tagslam compare_trajectories.py`，参数相同。
+
+两个 CSV 都须包含 `timestamp_ns`、`pose_valid`、`x,y,z,qx,qy,qz,qw`。时间为整数纳秒；位姿从物体到世界坐标系，位置以米计。TagSLAM 为参考（`rig=cam0`），OpenVINS 为 IMU 位姿；标定须包含 `cam0.T_cam_imu`，平移量以毫米计。
+
+**输出警告：** 使用同一输出目录重跑会替换生成的比较文件。
 
 ```bash
+# 比较参考轨迹与 OpenVINS 轨迹并保存统计和图表
 python3 src/python/compare_trajectories.py \
-  --reference /data/scl_data/slam/stereo_live_bags/EGO/400hz/tagslam_output/trajectory.csv \
-  --estimate /data/scl_data/slam/stereo_live_bags/EGO/400hz/openvins_output/job_004.csv \
-  --calib /data/scl_data/slam/stereo_live_bags/EGO/400hz/calib.yaml \
-  --output-dir /tmp/tagslam_trajectory_comparison_job004
+  --reference /absolute/path/to/tagslam/trajectory.csv \
+  --estimate /absolute/path/to/openvins/job_004.csv \
+  --calib /absolute/path/to/calib.yaml \
+  --output-dir /absolute/path/to/trajectory_comparison
 ```
 
-两个 CSV 都必须包含 `timestamp_ns`、`pose_valid`、`x,y,z,qx,qy,qz,qw`。位姿表示从物体坐标系到世界坐标系的变换，位置以米为单位，四元数按 `x,y,z,w` 排列。TagSLAM 作为参考而非真值，其中 `rig=cam0`；OpenVINS 位姿描述 IMU。工具将 OpenVINS 位姿右乘标定 YAML 中 `cam0.T_cam_imu` 的逆，转换为 cam0 位姿；该标定平移量以毫米为单位。工具不会再次应用标定中的 IMU 时间偏移，也不会估计时间偏移或尺度。
+参数依据：[比较脚本](src/python/compare_trajectories.py)。工具将 IMU 位姿转换为 cam0 位姿，进行刚体对齐，不估计尺度或时间偏移，也不重复应用标定时间偏移。需至少三个匹配点且轨迹不能静止或共线；不跨断点插值、不外推。无效位姿和超过 `--max-gap-s` 的间隔会分段；时间戳缺失或格式错误会报错。
 
-整数纳秒时间戳保留完整精度。工具会过滤无效位姿、归一化四元数、对时间戳排序，并在时间戳重复时保留最后一个有效行。仅有无效位姿的时间戳会使轨迹分段。在重叠的参考时间戳处，估计位置采用线性插值，方向采用最短弧球面线性插值（SLERP）。不允许外推或跨断点插值。超过 `--max-gap-s`（默认为 `0.1`）的采样间隔也会使相应轨迹分段。缺失或格式错误的整数时间戳会导致明确报错，因为无法确定断点位置。
+| 支持的参数／配置项 | 参数作用 | 输入/输出 | 默认值/支持的值 |
+| --- | --- | --- | --- |
+| `--reference` | TagSLAM 参考轨迹 | 输入文件 | 必填，无默认值；上述 CSV 格式 |
+| `--estimate` | OpenVINS 估计轨迹 | 输入文件 | 必填，无默认值；上述 CSV 格式 |
+| `--calib` | IMU 与 cam0 外参 | 输入文件 | 必填，无默认值；YAML |
+| `--output-dir` | 比较结果位置 | 输出目录 | 必填，无默认值；已有生成文件会被替换 |
+| `--max-gap-s` | 允许插值的最大采样间隔 | 输入值 | 默认 `0.1` 秒；有限正数 |
+| `-h` / `--help` | 显示帮助并退出 | 行为控制项 | 未指定时正常运行 |
 
-所有匹配位置共同确定一个最小二乘刚体对齐，不进行尺度校正；其旋转也用于变换方向。匹配数少于三个或位置几何退化（静止或共线轨迹）时会报错。位置 RMSE 是三维位置误差范数的均方根；旋转 RMSE 使用以度为单位的最短相对旋转角。每个匹配样本权重相同。此外还会报告平均值、中位数、P95 和最大值。
-
-一米漂移使用参考轨迹折线上的不重叠区间计算，并在精确的整米边界对两条轨迹进行插值。对每个区间，`delta = inverse(T_start) * T_end`，`E = inverse(delta_reference) * delta_estimate`。平移漂移为 `100 * norm(translation(E)) / 1m` 百分比；旋转漂移为 `rotation(E)` 的角度，以度/米为单位。每个断点处重新开始计量；不完整的尾段会被省略，并报告其总距离。如果没有完整区间，漂移结果不可用（JSON 中为 `null`），但仍会报告绝对误差。
-
-输出目录包含 `summary.json`（输入、约定、变换、过滤计数和统计信息）、`aligned_trajectory.csv`（匹配的参考位姿和对齐后的估计位姿、分段 ID 及误差）、`drift_1m.csv`（每个完整区间一行），以及 `trajectory_comparison.png`、`pose_errors.png`、`drift_1m.png`。绘图无需图形桌面。使用同一输出目录重新运行会替换这些生成的文件。在漂移 CSV 中，每个 `segment_id` 的距离从零重新开始；时间戳列用于定位原始数据中的轨迹段。
+输出包括 `summary.json`、`aligned_trajectory.csv`、`drift_1m.csv`、`trajectory_comparison.png`、`pose_errors.png` 和 `drift_1m.png`。TagSLAM 参考并非真值；误差按等权匹配样本统计。一米漂移在每个连续轨迹段内计算，不完整尾段省略；无完整一米区间时 JSON 漂移为 `null`，绝对误差仍可报告。漂移 CSV 的 `segment_id` 内距离从零开始，时间戳可定位原始数据。
 
 ### Rosbag
 
-播放 ROS 2 bag 时，必须向所有启动脚本传入 `use_sim_time:=True`，并让 ROS 2 bag 播放器驱动时钟：
+仅在外部播放器向在线节点供数时使用；所有相关节点均须设 `use_sim_time:=True`。
 
 ```bash
-ros2 bag play --clock-topics-all my_bag/
+# 回放 bag 并按所有话题驱动 ROS 时钟
+ros2 bag play \
+  --clock-topics-all \
+  my_bag/
 ```
 
-## 故障排查
-
-### 没有任何反应
-
-- 检查话题是否匹配。可以使用 `ros2 node info` 查看。
-- 如果运行多个相机，请检查它们是否同步，即各相机的 `header.stamp` 时间戳是否匹配。如果不匹配，请使用近似同步器。
-- 所有节点的 `use_sim_time` 设置是否一致？
-
-### 运动不平滑
-
-- 检查图像质量以及标记检测器是否正常工作。使用 [此仓库](https://github.com/ros-misc-utilities/apriltag_detector)中的 apriltag_detector，特别是 `apriltag_draw`；它可以作为 ROS 2 的 apt 包安装。
-
-### 重投影误差较大并出现 SUBGRAPH ERROR 警告
-
-- 图像质量差
-- 标定文件有误
-- 相机位姿文件有误
-- 标记尺寸错误
-- 指定的标记位姿错误
+| 支持的参数／配置项 | 参数作用 | 输入/输出 | 默认值/支持的值 |
+| --- | --- | --- | --- |
+| bag 路径（位置参数） | 指定回放数据 | 输入路径 | 必填，无默认值；`my_bag/` 为示例 |
+| `--clock-topics-all` | 按所有话题消息发布时钟 | 行为控制项 | 未指定时不启用此时钟模式 |
 
 ## 许可证
 
-本软件及其未来的所有贡献均采用 [Apache License 2.0](LICENSE) 授权。
+本软件及未来贡献采用 [Apache License 2.0](LICENSE)。
